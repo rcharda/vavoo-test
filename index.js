@@ -3,7 +3,7 @@ const crypto = require('node:crypto');
 const express = require('express');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
-const { Agent, setGlobalDispatcher } = require('undici');
+const { Agent, ProxyAgent, setGlobalDispatcher } = require('undici');
 
 const NodeCache = require('node-cache');
 
@@ -15,6 +15,29 @@ setGlobalDispatcher(new Agent({
     headersTimeout: 30000,
     bodyTimeout: 0,
 }));
+
+// --- Proxy sortant optionnel pour contourner un blocage IP du CDN source ---
+// Certains CDN (ex: "sunshine") renvoient 403/502 aux IP datacenter de Render.
+// En définissant OUTBOUND_PROXY_URL (ex: http://user:pass@host:port), toutes
+// les requêtes vers les flux vidéo passeront par ce proxy résidentiel/mobile
+// au lieu de l'IP Render directement. Laisser vide = comportement inchangé.
+const outboundProxyUrl = process.env.OUTBOUND_PROXY_URL || '';
+const outboundProxyDispatcher = outboundProxyUrl
+    ? new ProxyAgent(outboundProxyUrl)
+    : undefined;
+
+if (outboundProxyUrl) {
+    console.log('[proxy] Outbound proxy activé pour les flux vidéo');
+} else {
+    console.log('[proxy] OUTBOUND_PROXY_URL non défini — connexion directe (comportement par défaut)');
+}
+
+function getStreamFetchOptions(baseOptions) {
+    if (!outboundProxyDispatcher) {
+        return baseOptions;
+    }
+    return { ...baseOptions, dispatcher: outboundProxyDispatcher };
+}
 
 const program = new Command();
 
@@ -289,9 +312,9 @@ async function sendHlsMasterPlaylist(req, res, streamUrl) {
     setPlaylistHeaders(res);
 
     try {
-        const upstream = await fetchWithRetry(streamUrl, {
+        const upstream = await fetchWithRetry(streamUrl, getStreamFetchOptions({
             headers: getStreamHeaders(req)
-        });
+        }));
 
         if (!upstream.ok) {
             throw new Error(`upstream returned HTTP ${upstream.status}`);
@@ -691,10 +714,10 @@ async function proxyStream(req, res, streamUrl, channelName) {
     });
 
     try {
-        const upstream = await fetch(streamUrl, {
+        const upstream = await fetch(streamUrl, getStreamFetchOptions({
             signal: controller.signal,
             headers: getStreamHeaders(req)
-        });
+        }));
 
         if (!upstream.ok || !upstream.body) {
             throw new Error(`upstream returned HTTP ${upstream.status}`);
@@ -750,10 +773,10 @@ async function proxyUpstreamUrl(req, res, upstreamUrl) {
     });
 
     try {
-        const upstream = await fetchWithRetry(upstreamUrl, {
+        const upstream = await fetchWithRetry(upstreamUrl, getStreamFetchOptions({
             signal: controller.signal,
             headers: getStreamHeaders(req)
-        });
+        }));
 
         if (!upstream.ok || !upstream.body) {
             throw new Error(`upstream returned HTTP ${upstream.status}`);
