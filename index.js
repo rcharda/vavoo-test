@@ -278,11 +278,41 @@ function setPlaylistHeaders(res) {
 }
 
 /**
- * Returns a stable local master playlist for an upstream media playlist.
- * Example body contains one `#EXT-X-STREAM-INF` entry pointing to `/hls-proxy`.
+ * Fetches the real upstream master playlist and rewrites every variant
+ * (STREAM-INF) to go through our local proxy, preserving whatever quality
+ * levels (bandwidth/resolution) Vavoo actually offers. This enables real
+ * adaptive bitrate switching in the player when the source has more than
+ * one rendition. If fetching/parsing fails, or the source turns out to be
+ * single-quality, we fall back to a single-variant wrapper.
  */
-function sendHlsMasterPlaylist(req, res, streamUrl) {
+async function sendHlsMasterPlaylist(req, res, streamUrl) {
     setPlaylistHeaders(res);
+
+    try {
+        const upstream = await fetchWithRetry(streamUrl, {
+            headers: getStreamHeaders(req)
+        });
+
+        if (!upstream.ok) {
+            throw new Error(`upstream returned HTTP ${upstream.status}`);
+        }
+
+        const playlist = await upstream.text();
+        const hasVariants = /#EXT-X-STREAM-INF/i.test(playlist);
+
+        if (hasVariants) {
+            // Vraie playlist adaptative : on réécrit chaque variante (qualité)
+            // pour qu'elle passe par notre proxy, sans en perdre aucune.
+            const rewritten = rewriteM3u8Playlist(req, streamUrl, playlist);
+            res.send(rewritten);
+            return;
+        }
+    } catch (error) {
+        console.log(`[master playlist] fallback to single variant: ${error.message}`);
+    }
+
+    // Source à qualité unique (ou récupération impossible) : on garde
+    // l'ancien comportement, un seul flux proxifié.
     res.send([
         '#EXTM3U',
         '#EXT-X-VERSION:3',
@@ -842,7 +872,7 @@ app.get('/stream/:id', async function (req, res) {
 
         if (isM3u8Url(streamUrl)) {
             console.log(`[${connId}] hls master playlist "${channel.name}"`);
-            sendHlsMasterPlaylist(req, res, streamUrl);
+            await sendHlsMasterPlaylist(req, res, streamUrl);
             return;
         }
 
