@@ -725,7 +725,8 @@ async function proxyUpstreamUrl(req, res, upstreamUrl) {
             return;
         }
 
-        console.log(`[${connId}] hls proxy error "${upstreamLabel}": ${error.message}`);
+        const causeInfo = error.cause ? ` | cause: ${error.cause.code || error.cause.message || error.cause}` : '';
+        console.log(`[${connId}] hls proxy error "${upstreamLabel}": ${error.message}${causeInfo}`);
         if (!res.headersSent) {
             res.status(400).send(`upstream proxy error: ${error.message}`);
         }
