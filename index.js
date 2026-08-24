@@ -3,8 +3,18 @@ const crypto = require('node:crypto');
 const express = require('express');
 const { Readable } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
+const { Agent, setGlobalDispatcher } = require('undici');
 
 const NodeCache = require('node-cache');
+
+// Le timeout de connexion par défaut (~10s) est parfois trop court pour
+// certains CDN vidéo qui répondent lentement depuis certains datacenters.
+// On l'augmente pour éviter des échecs "UND_ERR_CONNECT_TIMEOUT" évitables.
+setGlobalDispatcher(new Agent({
+    connect: { timeout: 30000 },
+    headersTimeout: 30000,
+    bodyTimeout: 0,
+}));
 
 const program = new Command();
 
@@ -685,6 +695,21 @@ async function proxyStream(req, res, streamUrl, channelName) {
     }
 }
 
+async function fetchWithRetry(url, options, retries = 2) {
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await fetch(url, options);
+        } catch (error) {
+            const isLastAttempt = attempt === retries;
+            const isAbort = options.signal?.aborted;
+            if (isAbort || isLastAttempt) {
+                throw error;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 400));
+        }
+    }
+}
+
 async function proxyUpstreamUrl(req, res, upstreamUrl) {
     const connId = `${req.socket.remoteAddress}`;
     const controller = new AbortController();
@@ -695,7 +720,7 @@ async function proxyUpstreamUrl(req, res, upstreamUrl) {
     });
 
     try {
-        const upstream = await fetch(upstreamUrl, {
+        const upstream = await fetchWithRetry(upstreamUrl, {
             signal: controller.signal,
             headers: getStreamHeaders(req)
         });
