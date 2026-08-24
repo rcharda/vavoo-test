@@ -7,31 +7,12 @@ const { Agent, ProxyAgent, setGlobalDispatcher } = require('undici');
 
 const NodeCache = require('node-cache');
 
-// Le timeout de connexion par défaut (~10s) est parfois trop court pour
-// certains CDN vidéo qui répondent lentement depuis certains datacenters.
-// On l'augmente pour éviter des échecs "UND_ERR_CONNECT_TIMEOUT" évitables.
 setGlobalDispatcher(new Agent({
     connect: { timeout: 30000 },
     headersTimeout: 30000,
     bodyTimeout: 0,
 }));
 
-// --- Proxy(ies) sortant(s) optionnel(s) pour contourner un blocage IP du CDN source ---
-// Certains CDN (ex: "sunshine") renvoient 403/502 aux IP datacenter de Render.
-//
-// Deux types de routes sont supportées, dans l'ordre où elles seront essayées :
-//  1. Proxies "classiques" (résidentiel/mobile), via OUTBOUND_PROXY_URLS
-//     (liste séparée par des virgules, ex: "http://u1:p1@host1:port,http://u2:p2@host2:port").
-//     OUTBOUND_PROXY_URL (singulier) reste supporté pour compatibilité.
-//  2. Proxies "relais" (Cloudflare Worker), via RELAY_PROXY_URLS
-//     (ex: "https://vavoo-relay.mon-pseudo.workers.dev"). Ces proxies fonctionnent
-//     comme une URL de relais : on leur envoie ?url=<url_cible> et ils font la
-//     requête depuis leur propre IP. RELAY_SECRET (optionnel) est renvoyé dans
-//     l'en-tête x-relay-secret si le Worker vérifie un secret partagé.
-//
-// Si aucune route ne réussit, on retombe sur une connexion directe en dernier
-// recours (sauf si DISABLE_DIRECT_FALLBACK=true). Laisser toutes ces variables
-// vides = comportement inchangé (connexion directe uniquement).
 const RETRYABLE_STATUS_CODES = new Set([403, 408, 429, 500, 502, 503, 504]);
 
 function parseUrlList(raw) {
@@ -82,12 +63,6 @@ if (outboundRoutes.length === 0 || !disableDirectFallback) {
     });
 }
 
-if (classicProxyUrls.length || relayProxyUrls.length) {
-    console.log(`[proxy] Routes configurées (dans l'ordre): ${outboundRoutes.map((route) => route.name).join(', ')}`);
-} else {
-    console.log('[proxy] Aucun OUTBOUND_PROXY_URLS/OUTBOUND_PROXY_URL/RELAY_PROXY_URLS défini — connexion directe uniquement');
-}
-
 const program = new Command();
 
 program
@@ -105,40 +80,25 @@ const options = program.opts();
 
 function getBaseSites(selection) {
     const normalized = String(selection || 'both').trim().toLowerCase();
-
-    if (normalized === 'primary') {
-        return ['https://vavoo.to'];
-    }
-
-    if (normalized === 'fallback') {
-        return ['https://kool.to'];
-    }
-
+    if (normalized === 'primary') return ['https://vavoo.to'];
+    if (normalized === 'fallback') return ['https://kool.to'];
     return ['https://vavoo.to', 'https://kool.to'];
 }
 
 const app = express();
 
-// Autoriser les requêtes cross-origin (CORS) — doit passer AVANT l'authentification,
-// sinon la requête "preflight" OPTIONS se fait bloquer par l'auth avant de recevoir
-// les en-têtes CORS, ce que le navigateur interprète comme une erreur CORS.
 app.use(function (req, res, next) {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type, Authorization');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
-
     if (req.method === 'OPTIONS') {
         res.sendStatus(204);
         return;
     }
-
     next();
 });
 
-// --- Accès familial : identifiants fixes ---
-// Ajoute/retire des membres de la famille ici. Simple protection,
-// pas de gestion de comptes ni d'expiration.
 const FAMILY_USERS = {
     'papa': 'change-moi-1',
     'famille': 'change-moi-2',
@@ -147,14 +107,12 @@ const FAMILY_USERS = {
 app.use(function (req, res, next) {
     const header = req.headers.authorization || '';
     const [scheme, encoded] = header.split(' ');
-
     if (scheme === 'Basic' && encoded) {
         const [user, pass] = Buffer.from(encoded, 'base64').toString().split(':');
         if (FAMILY_USERS[user] && FAMILY_USERS[user] === pass) {
             return next();
         }
     }
-
     res.setHeader('WWW-Authenticate', 'Basic realm="Vavoo Proxy"');
     res.status(401).send('Authentification requise');
 });
@@ -168,19 +126,24 @@ const redirect = Boolean(options.redirect);
 const baseSites = getBaseSites(vavooUrlList);
 
 const cache = new NodeCache();
-
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 const CHANNELS_CACHE_KEY = 'vavoo_channels';
 const SIGNATURE_CACHE_KEY = 'vavoo_addon_sig';
 const COUNTRY_SEPARATORS = ['➾', '⟾', '->', '→', '»', '›'];
-const PING_URLS = [
-    'https://www.vavoo.tv/api/app/ping'
-];
+const PING_URLS = ['https://www.vavoo.tv/api/app/ping'];
 
 function getLocalBaseUrl() {
     return `http://${httpHost}:${port}`;
 }
+
+// --- Identifiants intégrés dans les URLs publiques générées ---
+// Puisque le lecteur vidéo (hls.js) n'envoie pas d'en-tête Authorization,
+// on encode "user:pass@" directement dans l'origine publique utilisée pour
+// construire /stream/:id et /hls-proxy?url=... . Ainsi CHAQUE requête faite
+// par le lecteur (playlist ET segments) porte déjà les identifiants.
+const PLAYER_AUTH_USER = process.env.PLAYER_AUTH_USER || 'papa';
+const PLAYER_AUTH_PASS = process.env.PLAYER_AUTH_PASS || FAMILY_USERS[PLAYER_AUTH_USER] || 'change-moi-1';
 
 function getPublicOrigin(req) {
     const forwardedHost = req.headers['x-forwarded-host'];
@@ -191,7 +154,8 @@ function getPublicOrigin(req) {
     if (!isLocal) {
         proto = 'https';
     }
-    return `${proto}://${host}`;
+    const userInfo = `${encodeURIComponent(PLAYER_AUTH_USER)}:${encodeURIComponent(PLAYER_AUTH_PASS)}@`;
+    return `${proto}://${userInfo}${host}`;
 }
 
 function buildHomePage() {
@@ -211,45 +175,16 @@ function buildHomePage() {
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Vavoo Proxy</title>
   <style>
-    :root {
-      color-scheme: dark;
-      --bg: #111111;
-      --text: #f3f3f3;
-      --muted: #b8b8b8;
-      --link: #8fd3ff;
-    }
+    :root { color-scheme: dark; --bg: #111111; --text: #f3f3f3; --muted: #b8b8b8; --link: #8fd3ff; }
     * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      font-family: sans-serif;
-      background: var(--bg);
-      color: var(--text);
-    }
-    main {
-      max-width: 760px;
-      margin: 0 auto;
-      padding: 24px 18px 40px;
-    }
-    h1 {
-      margin: 0 0 10px;
-      font-size: 28px;
-    }
-    p {
-      margin: 0 0 18px;
-      color: var(--muted);
-    }
-    ul {
-      margin: 0;
-      padding-left: 20px;
-    }
+    body { margin: 0; font-family: sans-serif; background: var(--bg); color: var(--text); }
+    main { max-width: 760px; margin: 0 auto; padding: 24px 18px 40px; }
+    h1 { margin: 0 0 10px; font-size: 28px; }
+    p { margin: 0 0 18px; color: var(--muted); }
+    ul { margin: 0; padding-left: 20px; }
     li { margin: 10px 0; }
-    a {
-      color: var(--link);
-      word-break: break-all;
-    }
-    code {
-      color: var(--text);
-    }
+    a { color: var(--link); word-break: break-all; }
+    code { color: var(--text); }
   </style>
 </head>
 <body>
@@ -280,26 +215,18 @@ function normalizeChannelIdPart(value) {
 }
 
 function getStableChannelId(name, country) {
-    const seed = [
-        normalizeChannelIdPart(country),
-        normalizeChannelIdPart(name)
-    ].join('|');
-
+    const seed = [normalizeChannelIdPart(country), normalizeChannelIdPart(name)].join('|');
     return crypto.createHash('sha1').update(seed).digest('hex').slice(0, 22);
 }
 
 function extractCountry(group) {
     const rawGroup = String(group || '').trim();
-    if (!rawGroup) {
-        return 'default';
-    }
-
+    if (!rawGroup) return 'default';
     for (const separator of COUNTRY_SEPARATORS) {
         if (rawGroup.includes(separator)) {
             return rawGroup.split(separator)[0].trim() || 'default';
         }
     }
-
     return rawGroup;
 }
 
@@ -315,66 +242,30 @@ function getCatalogHeaders(signature) {
     };
 }
 
-/**
- * Builds upstream playback headers and forwards byte ranges.
- * Example: Range `bytes=0-1023` is passed through to HLS segments.
- */
 function getStreamHeaders(req) {
-    const headers = {
-        'User-Agent': 'VAVOO/2.6',
-        'Connection': 'close'
-    };
-
-    if (req.headers.range) {
-        headers.Range = req.headers.range;
-    }
-
+    const headers = { 'User-Agent': 'VAVOO/2.6', 'Connection': 'close' };
+    if (req.headers.range) headers.Range = req.headers.range;
     return headers;
 }
 
-/**
- * Wraps an upstream HLS URL with the local HLS proxy endpoint.
- * Example: `https://host/live.m3u8` -> `/hls-proxy?url=...`.
- */
 function getProxiedUpstreamUrl(req, upstreamUrl) {
     return `${getPublicOrigin(req)}/hls-proxy?url=${encodeURIComponent(upstreamUrl)}`;
 }
 
-/**
- * Sends HLS playlists as uncached M3U8 responses.
- */
 function setPlaylistHeaders(res) {
     res.type('application/vnd.apple.mpegurl');
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     res.setHeader('Pragma', 'no-cache');
 }
 
-/**
- * Fetches the real upstream master playlist and rewrites every variant
- * (STREAM-INF) to go through our local proxy, preserving whatever quality
- * levels (bandwidth/resolution) Vavoo actually offers. This enables real
- * adaptive bitrate switching in the player when the source has more than
- * one rendition. If fetching/parsing fails, or the source turns out to be
- * single-quality, we fall back to a single-variant wrapper.
- */
 async function sendHlsMasterPlaylist(req, res, streamUrl) {
     setPlaylistHeaders(res);
-
     try {
-        const upstream = await fetchWithRetry(streamUrl, {
-            headers: getStreamHeaders(req)
-        });
-
-        if (!upstream.ok) {
-            throw new Error(`upstream returned HTTP ${upstream.status}`);
-        }
-
+        const upstream = await fetchWithRetry(streamUrl, { headers: getStreamHeaders(req) });
+        if (!upstream.ok) throw new Error(`upstream returned HTTP ${upstream.status}`);
         const playlist = await upstream.text();
         const hasVariants = /#EXT-X-STREAM-INF/i.test(playlist);
-
         if (hasVariants) {
-            // Vraie playlist adaptative : on réécrit chaque variante (qualité)
-            // pour qu'elle passe par notre proxy, sans en perdre aucune.
             const rewritten = rewriteM3u8Playlist(req, streamUrl, playlist);
             res.send(rewritten);
             return;
@@ -382,9 +273,6 @@ async function sendHlsMasterPlaylist(req, res, streamUrl) {
     } catch (error) {
         console.log(`[master playlist] fallback to single variant: ${error.message}`);
     }
-
-    // Source à qualité unique (ou récupération impossible) : on garde
-    // l'ancien comportement, un seul flux proxifié.
     res.send([
         '#EXTM3U',
         '#EXT-X-VERSION:3',
@@ -393,90 +281,51 @@ async function sendHlsMasterPlaylist(req, res, streamUrl) {
     ].join('\n') + '\n');
 }
 
-/**
- * Checks whether a URL path points at an M3U8 playlist.
- * Example: `/hls/index.m3u8` returns true.
- */
 function isM3u8Url(upstreamUrl) {
     return new URL(upstreamUrl).pathname.toLowerCase().endsWith('.m3u8');
 }
 
-/**
- * Detects HLS playlists by content type or URL suffix.
- */
 function isM3u8Response(upstreamUrl, contentType) {
     return String(contentType || '').toLowerCase().includes('mpegurl')
         || String(contentType || '').toLowerCase().includes('application/vnd.apple')
         || isM3u8Url(upstreamUrl);
 }
 
-/**
- * Keeps non-fetchable playlist URIs untouched.
- * Example: `skd://key-id` is not rewritten.
- */
 function shouldRewritePlaylistUri(uri) {
     const trimmed = String(uri || '').trim();
-    if (!trimmed) {
-        return false;
-    }
-
+    if (!trimmed) return false;
     return !/^(data|urn|skd):/i.test(trimmed);
 }
 
-/**
- * Resolves a playlist URI relative to its source and proxies it locally.
- * Example: `seg.ts` under `https://h/live/index.m3u8` becomes `/hls-proxy?.../live/seg.ts`.
- */
 function rewritePlaylistUri(req, baseUrl, uri) {
-    if (!shouldRewritePlaylistUri(uri)) {
-        return uri;
-    }
-
+    if (!shouldRewritePlaylistUri(uri)) return uri;
     return getProxiedUpstreamUrl(req, new URL(uri, baseUrl).toString());
 }
 
-/**
- * Rewrites HLS media, variant, key, and map URLs to local proxy URLs.
- * Example: segment lines and `URI="key.bin"` attributes are rewritten.
- */
 function rewriteM3u8Playlist(req, upstreamUrl, playlist) {
     return String(playlist)
         .split(/\r?\n/)
         .map(function (line) {
             const trimmed = line.trim();
-
-            if (!trimmed) {
-                return line;
-            }
-
+            if (!trimmed) return line;
             if (trimmed.startsWith('#')) {
                 return line.replace(/URI="([^"]+)"/g, function (match, uri) {
                     return `URI="${rewritePlaylistUri(req, upstreamUrl, uri)}"`;
                 });
             }
-
             return rewritePlaylistUri(req, upstreamUrl, trimmed);
         })
         .join('\n');
 }
 
-/**
- * Extracts compact debug details from an HLS playlist.
- * Example: `#EXT-X-MEDIA-SEQUENCE:42` returns sequence `42`.
- */
 function getPlaylistDebugInfo(playlist) {
     const lines = String(playlist).split(/\r?\n/);
     const sequenceLine = lines.find((line) => line.startsWith('#EXT-X-MEDIA-SEQUENCE:'));
     const sequence = sequenceLine ? sequenceLine.split(':')[1] : 'n/a';
     const segments = lines.filter((line) => line.trim() && !line.trim().startsWith('#')).length;
-
     return { sequence, segments };
 }
 
-/**
- * Shortens an upstream URL for readable debug logs.
- * Example: `https://a.test/x/y.ts?token=...` -> `a.test/x/y.ts`.
- */
 function describeUpstreamUrl(upstreamUrl) {
     const url = new URL(upstreamUrl);
     return `${url.hostname}${url.pathname}`;
@@ -484,75 +333,31 @@ function describeUpstreamUrl(upstreamUrl) {
 
 function setUpstreamHeaders(res, upstream) {
     const contentType = upstream.headers.get('content-type');
-    if (contentType) {
-        res.setHeader('Content-Type', contentType);
-    }
-
+    if (contentType) res.setHeader('Content-Type', contentType);
     const contentLength = upstream.headers.get('content-length');
-    if (contentLength) {
-        res.setHeader('Content-Length', contentLength);
-    }
-
+    if (contentLength) res.setHeader('Content-Length', contentLength);
     const acceptRanges = upstream.headers.get('accept-ranges');
-    if (acceptRanges) {
-        res.setHeader('Accept-Ranges', acceptRanges);
-    }
-
+    if (acceptRanges) res.setHeader('Accept-Ranges', acceptRanges);
     const contentRange = upstream.headers.get('content-range');
-    if (contentRange) {
-        res.setHeader('Content-Range', contentRange);
-    }
+    if (contentRange) res.setHeader('Content-Range', contentRange);
 }
 
 function getPingPayload() {
     const currentTimestamp = Date.now();
-
     return {
-        reason: 'app-focus',
-        locale: currentLanguage,
-        theme: 'dark',
+        reason: 'app-focus', locale: currentLanguage, theme: 'dark',
         metadata: {
-            device: {
-                type: 'desktop',
-                uniqueId: `node-${currentTimestamp}`
-            },
-            os: {
-                name: 'linux',
-                version: 'Linux',
-                abis: ['x64'],
-                host: 'node'
-            },
-            app: {
-                platform: 'electron'
-            },
-            version: {
-                package: 'tv.vavoo.app',
-                binary: '3.1.8',
-                js: '3.1.8'
-            }
+            device: { type: 'desktop', uniqueId: `node-${currentTimestamp}` },
+            os: { name: 'linux', version: 'Linux', abis: ['x64'], host: 'node' },
+            app: { platform: 'electron' },
+            version: { package: 'tv.vavoo.app', binary: '3.1.8', js: '3.1.8' }
         },
-        appFocusTime: 0,
-        playerActive: false,
-        playDuration: 0,
-        devMode: false,
-        hasAddon: true,
-        castConnected: false,
-        package: 'tv.vavoo.app',
-        version: '3.1.8',
-        process: 'app',
-        firstAppStart: currentTimestamp,
-        lastAppStart: currentTimestamp,
-        ipLocation: null,
-        adblockEnabled: true,
-        proxy: {
-            supported: ['ss'],
-            engine: 'Mu',
-            enabled: false,
-            autoServer: true
-        },
-        iap: {
-            supported: false
-        }
+        appFocusTime: 0, playerActive: false, playDuration: 0, devMode: false,
+        hasAddon: true, castConnected: false, package: 'tv.vavoo.app', version: '3.1.8',
+        process: 'app', firstAppStart: currentTimestamp, lastAppStart: currentTimestamp,
+        ipLocation: null, adblockEnabled: true,
+        proxy: { supported: ['ss'], engine: 'Mu', enabled: false, autoServer: true },
+        iap: { supported: false }
     };
 }
 
@@ -563,35 +368,23 @@ async function requestJson(options) {
         body: options.body ? JSON.stringify(options.body) : undefined,
         signal: AbortSignal.timeout(options.timeout || 30000),
     });
-
     const body = await response.json();
-
     if (!response.ok) {
         const error = new Error(`HTTP ${response.status} for ${options.url}`);
         error.statusCode = response.status;
         error.body = body;
         throw error;
     }
-
     return body;
 }
 
 async function getAddonSignature() {
     const cached = cache.get(SIGNATURE_CACHE_KEY);
-    if (cached) {
-        return cached;
-    }
-
+    if (cached) return cached;
     const payload = getPingPayload();
-
     for (const url of PING_URLS) {
         try {
-            const body = await requestJson({
-                method: 'POST',
-                url,
-                body: payload,
-            });
-
+            const body = await requestJson({ method: 'POST', url, body: payload });
             const signature = body?.addonSig;
             if (signature) {
                 cache.set(SIGNATURE_CACHE_KEY, signature, 300);
@@ -601,21 +394,15 @@ async function getAddonSignature() {
             console.log(`[vavoo] addonSig request failed for ${url}: ${error.message}`);
         }
     }
-
     throw new Error('Unable to obtain addonSig');
 }
 
 function mapCatalogItem(item) {
     const name = item.name || 'Unknown Channel';
     const country = extractCountry(item.group);
-
     return {
         id: getStableChannelId(name, country),
-        url: item.url,
-        name,
-        logo: item.logo || '',
-        group: item.group || '',
-        country
+        url: item.url, name, logo: item.logo || '', group: item.group || '', country
     };
 }
 
@@ -624,55 +411,29 @@ async function loadCatalogFromBase(baseUrl, signature) {
     const headers = getCatalogHeaders(signature);
     const channels = [];
     let cursor = null;
-
     while (true) {
         const body = await requestJson({
-            method: 'POST',
-            url: catalogUrl,
-            headers,
+            method: 'POST', url: catalogUrl, headers,
             body: {
-                language: currentLanguage,
-                region: currentRegion,
-                catalogId: 'iptv',
-                id: 'iptv',
-                adult: false,
-                search: '',
-                sort: '',
-                filter: {},
-                cursor,
-                clientVersion: '3.0.2'
+                language: currentLanguage, region: currentRegion, catalogId: 'iptv', id: 'iptv',
+                adult: false, search: '', sort: '', filter: {}, cursor, clientVersion: '3.0.2'
             }
         });
-
         const items = Array.isArray(body?.items) ? body.items : [];
         for (const item of items) {
-            if (item?.type === 'iptv' && item?.url) {
-                channels.push(mapCatalogItem(item));
-            }
+            if (item?.type === 'iptv' && item?.url) channels.push(mapCatalogItem(item));
         }
-
-        if (!body?.nextCursor) {
-            break;
-        }
-
+        if (!body?.nextCursor) break;
         cursor = body.nextCursor;
     }
-
     return channels;
 }
 
 async function getChannels(forceRefresh = false) {
-    if (forceRefresh) {
-        cache.del(CHANNELS_CACHE_KEY);
-    }
-
+    if (forceRefresh) cache.del(CHANNELS_CACHE_KEY);
     const cached = cache.get(CHANNELS_CACHE_KEY);
-    if (cached) {
-        return cached;
-    }
-
+    if (cached) return cached;
     const signature = await getAddonSignature();
-
     for (const baseUrl of baseSites) {
         try {
             const channels = await loadCatalogFromBase(baseUrl, signature);
@@ -683,7 +444,6 @@ async function getChannels(forceRefresh = false) {
             console.log(`[vavoo] catalog load failed for ${baseUrl}: ${error.message}`);
         }
     }
-
     throw new Error('Unable to load channel catalog');
 }
 
@@ -695,9 +455,7 @@ async function getChannelsByCountry(country) {
 async function getCountries() {
     const channels = await getChannels();
     return [...new Set(
-        channels
-            .map((channel) => channel.country)
-            .filter((country) => country && normalize(country) !== 'default')
+        channels.map((channel) => channel.country).filter((country) => country && normalize(country) !== 'default')
     )].sort((left, right) => left.localeCompare(right));
 }
 
@@ -706,72 +464,40 @@ async function findChannelById(id) {
     return channels.find((channel) => String(channel.id) === String(id));
 }
 
-/**
- * Strips player pipe options accidentally sent as part of the path.
- * Example: `123|User-Agent=VAVOO/2.6` -> `123`.
- */
 function normalizeStreamId(id) {
     return String(id || '').split('|')[0];
 }
 
 async function resolveStreamUrl(channel) {
     const signature = await getAddonSignature();
-
     for (const baseUrl of baseSites) {
         const resolveUrl = `${baseUrl.replace(/\/$/, '')}/mediahubmx-resolve.json`;
-
         try {
             const body = await requestJson({
-                method: 'POST',
-                url: resolveUrl,
-                headers: getCatalogHeaders(signature),
-                body: {
-                    language: currentLanguage,
-                    region: currentRegion,
-                    url: channel.url,
-                    clientVersion: '3.0.2'
-                }
+                method: 'POST', url: resolveUrl, headers: getCatalogHeaders(signature),
+                body: { language: currentLanguage, region: currentRegion, url: channel.url, clientVersion: '3.0.2' }
             });
-
-            if (Array.isArray(body) && body[0]?.url) {
-                return body[0].url;
-            }
-
-            if (body?.url) {
-                return body.url;
-            }
-
-            if (body?.streamUrl) {
-                return body.streamUrl;
-            }
+            if (Array.isArray(body) && body[0]?.url) return body[0].url;
+            if (body?.url) return body.url;
+            if (body?.streamUrl) return body.streamUrl;
         } catch (error) {
             const causeInfo = error.cause ? ` | cause: ${error.cause.code || error.cause.message || error.cause}` : '';
             console.log(`[vavoo] resolve failed for ${baseUrl}: ${error.message}${causeInfo}`);
         }
     }
-
     throw new Error(`Unable to resolve stream for channel ${channel.name}`);
 }
 
 async function proxyStream(req, res, streamUrl, channelName) {
     const connId = `${req.socket.remoteAddress}`;
     const controller = new AbortController();
-
     req.socket.on('close', function () {
         console.log(`[${connId}] connection closed`);
         controller.abort();
     });
-
     try {
-        const upstream = await fetchWithRetry(streamUrl, {
-            signal: controller.signal,
-            headers: getStreamHeaders(req)
-        });
-
-        if (!upstream.ok || !upstream.body) {
-            throw new Error(`upstream returned HTTP ${upstream.status}`);
-        }
-
+        const upstream = await fetchWithRetry(streamUrl, { signal: controller.signal, headers: getStreamHeaders(req) });
+        if (!upstream.ok || !upstream.body) throw new Error(`upstream returned HTTP ${upstream.status}`);
         const contentType = upstream.headers.get('content-type');
         if (isM3u8Response(streamUrl, contentType)) {
             const playlist = await upstream.text();
@@ -780,7 +506,6 @@ async function proxyStream(req, res, streamUrl, channelName) {
             res.send(rewrittenPlaylist);
             return;
         }
-
         setUpstreamHeaders(res, upstream);
         console.log(`[${connId}] starting stream proxy "${channelName}"`);
         await pipeline(Readable.fromWeb(upstream.body), res);
@@ -789,53 +514,33 @@ async function proxyStream(req, res, streamUrl, channelName) {
             console.log(`[${connId}] stream ended "${channelName}"`);
             return;
         }
-
         console.log(`[${connId}] stream error "${channelName}": ${error.message}`);
-        if (!res.headersSent) {
-            res.status(400).send(`stream error: ${error.message}`);
-        }
+        if (!res.headersSent) res.status(400).send(`stream error: ${error.message}`);
     }
 }
 
 async function fetchWithRetry(url, baseOptions, retriesPerRoute = 2) {
     let lastError;
-
     for (const route of outboundRoutes) {
         for (let attempt = 1; attempt <= retriesPerRoute + 1; attempt++) {
-            if (baseOptions.signal?.aborted) {
-                throw lastError || new Error('aborted');
-            }
-
+            if (baseOptions.signal?.aborted) throw lastError || new Error('aborted');
             try {
                 const [fetchUrl, fetchOptions] = route.buildFetch(url, baseOptions);
                 const response = await fetch(fetchUrl, fetchOptions);
-
-                if (!RETRYABLE_STATUS_CODES.has(response.status)) {
-                    return response;
-                }
-
+                if (!RETRYABLE_STATUS_CODES.has(response.status)) return response;
                 console.log(`[hls-proxy] ${route.name} attempt ${attempt}/${retriesPerRoute + 1} got HTTP ${response.status} for ${describeUpstreamUrl(url)}`);
                 lastError = new Error(`upstream returned HTTP ${response.status}`);
-
-                if (attempt <= retriesPerRoute) {
-                    await new Promise((resolve) => setTimeout(resolve, 400));
-                }
+                if (attempt <= retriesPerRoute) await new Promise((resolve) => setTimeout(resolve, 400));
             } catch (error) {
                 lastError = error;
-                if (baseOptions.signal?.aborted) {
-                    throw error;
-                }
+                if (baseOptions.signal?.aborted) throw error;
                 const causeInfo = error.cause ? ` | cause: ${error.cause.code || error.cause.message || error.cause}` : '';
                 console.log(`[hls-proxy] ${route.name} attempt ${attempt}/${retriesPerRoute + 1} network error for ${describeUpstreamUrl(url)}: ${error.message}${causeInfo}`);
-                if (attempt <= retriesPerRoute) {
-                    await new Promise((resolve) => setTimeout(resolve, 400));
-                }
+                if (attempt <= retriesPerRoute) await new Promise((resolve) => setTimeout(resolve, 400));
             }
         }
-
         console.log(`[hls-proxy] route "${route.name}" exhausted, trying next route`);
     }
-
     throw lastError || new Error('all routes exhausted');
 }
 
@@ -843,21 +548,10 @@ async function proxyUpstreamUrl(req, res, upstreamUrl) {
     const connId = `${req.socket.remoteAddress}`;
     const controller = new AbortController();
     const upstreamLabel = describeUpstreamUrl(upstreamUrl);
-
-    req.socket.on('close', function () {
-        controller.abort();
-    });
-
+    req.socket.on('close', function () { controller.abort(); });
     try {
-        const upstream = await fetchWithRetry(upstreamUrl, {
-            signal: controller.signal,
-            headers: getStreamHeaders(req)
-        });
-
-        if (!upstream.ok || !upstream.body) {
-            throw new Error(`upstream returned HTTP ${upstream.status}`);
-        }
-
+        const upstream = await fetchWithRetry(upstreamUrl, { signal: controller.signal, headers: getStreamHeaders(req) });
+        if (!upstream.ok || !upstream.body) throw new Error(`upstream returned HTTP ${upstream.status}`);
         const contentType = upstream.headers.get('content-type');
         if (isM3u8Response(upstreamUrl, contentType)) {
             const playlist = await upstream.text();
@@ -868,7 +562,6 @@ async function proxyUpstreamUrl(req, res, upstreamUrl) {
             res.send(rewrittenPlaylist);
             return;
         }
-
         setUpstreamHeaders(res, upstream);
         res.status(upstream.status);
         console.log(`[${connId}] hls asset "${upstreamLabel}" status=${upstream.status} type="${contentType || 'unknown'}"`);
@@ -878,12 +571,9 @@ async function proxyUpstreamUrl(req, res, upstreamUrl) {
             console.log(`[${connId}] hls proxy ended "${upstreamLabel}"`);
             return;
         }
-
         const causeInfo = error.cause ? ` | cause: ${error.cause.code || error.cause.message || error.cause}` : '';
         console.log(`[${connId}] hls proxy error "${upstreamLabel}": ${error.message}${causeInfo}`);
-        if (!res.headersSent) {
-            res.status(400).send(`upstream proxy error: ${error.message}`);
-        }
+        if (!res.headersSent) res.status(400).send(`upstream proxy error: ${error.message}`);
     }
 }
 
@@ -905,14 +595,12 @@ app.get('/channels.m3u8', async function (req, res) {
         const country = req.query.country;
         const channels = country ? await getChannelsByCountry(country) : await getChannels();
         const output = ['#EXTM3U'];
-
         for (const channel of channels) {
             output.push(`#EXTINF:-1 tvg-name="${channel.name}" group-title="${channel.country}" tvg-logo="${channel.logo}" tvg-id="${channel.name}",${channel.name}`);
             output.push('#EXTVLCOPT:http-user-agent=VAVOO/2.6');
             output.push('#EXTVLCOPT:no-ssl-verify');
             output.push(`${getPublicOrigin(req)}/stream/${encodeURIComponent(channel.id)}`);
         }
-
         setPlaylistHeaders(res);
         res.send(output.join('\n'));
     } catch (error) {
@@ -924,13 +612,11 @@ app.get('/channels.m3u8', async function (req, res) {
 app.get('/hls-proxy', async function (req, res) {
     const upstreamUrl = req.query.url;
     const connId = `${req.socket.remoteAddress}`;
-
     if (!upstreamUrl) {
         console.log(`[${connId}] hls proxy error: missing url`);
         res.status(400).send('missing url');
         return;
     }
-
     try {
         const parsedUrl = new URL(upstreamUrl);
         if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
@@ -938,7 +624,6 @@ app.get('/hls-proxy', async function (req, res) {
             res.status(400).send('unsupported upstream protocol');
             return;
         }
-
         console.log(`[${connId}] hls proxy opened "${describeUpstreamUrl(parsedUrl.toString())}"`);
         await proxyUpstreamUrl(req, res, parsedUrl.toString());
     } catch (error) {
@@ -950,40 +635,30 @@ app.get('/hls-proxy', async function (req, res) {
 app.get('/stream/:id', async function (req, res) {
     const connId = `${req.socket.remoteAddress}`;
     const userAgent = req.headers['user-agent'] ?? 'unknown';
-
     try {
         console.log(`[${connId}] connection opened: "${userAgent}"`);
-
         const channelId = normalizeStreamId(req.params.id);
         const channel = await findChannelById(channelId);
         if (!channel) {
             res.status(404).send(`unknown channel: ${channelId}`);
             return;
         }
-
         const streamUrl = await resolveStreamUrl(channel);
         console.log(`[${connId}] resolved "${channel.name}": ${streamUrl}`);
-
         if (redirect && userAgent.toLowerCase().includes('vavoo')) {
             res.redirect(streamUrl);
             return;
         }
-
         if (isM3u8Url(streamUrl)) {
             console.log(`[${connId}] hls master playlist "${channel.name}"`);
             await sendHlsMasterPlaylist(req, res, streamUrl);
             return;
         }
-
         await proxyStream(req, res, streamUrl, channel.name);
     } catch (error) {
         console.log(`[${connId}] playback error for channel "${req.params.id}":`, error.message);
-        if (error.body) {
-            console.log(`[${connId}] upstream error body:`, JSON.stringify(error.body));
-        }
-        if (error.stack) {
-            console.log(error.stack);
-        }
+        if (error.body) console.log(`[${connId}] upstream error body:`, JSON.stringify(error.body));
+        if (error.stack) console.log(error.stack);
         res.status(500).send(error.message);
     }
 });
