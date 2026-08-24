@@ -16,44 +16,77 @@ setGlobalDispatcher(new Agent({
     bodyTimeout: 0,
 }));
 
-// --- Proxy(s) sortant(s) optionnel(s) pour contourner un blocage IP du CDN source ---
+// --- Proxy(ies) sortant(s) optionnel(s) pour contourner un blocage IP du CDN source ---
 // Certains CDN (ex: "sunshine") renvoient 403/502 aux IP datacenter de Render.
-// On accepte une LISTE de proxies (OUTBOUND_PROXY_URLS séparés par des virgules,
-// ou l'ancien OUTBOUND_PROXY_URL pour un seul), et on bascule automatiquement
-// de l'un à l'autre — puis en dernier recours en connexion directe — si un
-// proxy échoue ou renvoie une erreur "retryable" (403/429/5xx). Laisser vide =
-// connexion directe uniquement (comportement par défaut).
-const outboundProxyUrls = (process.env.OUTBOUND_PROXY_URLS || process.env.OUTBOUND_PROXY_URL || '')
-    .split(',')
-    .map((url) => url.trim())
-    .filter(Boolean);
-
-// Chaque "route" a un nom (pour les logs) et un dispatcher optionnel
-// (undefined = connexion directe, toujours ajoutée en dernier repli).
-const outboundRoutes = [
-    ...outboundProxyUrls.map((url, index) => ({
-        name: `proxy#${index + 1}`,
-        dispatcher: new ProxyAgent(url),
-    })),
-    { name: 'direct', dispatcher: undefined },
-];
-
-if (outboundProxyUrls.length > 0) {
-    console.log(`[proxy] ${outboundProxyUrls.length} proxy(s) sortant(s) configuré(s), avec repli direct en dernier recours`);
-} else {
-    console.log('[proxy] Aucun OUTBOUND_PROXY_URLS/OUTBOUND_PROXY_URL défini — connexion directe uniquement');
-}
-
-function getStreamFetchOptions(baseOptions, dispatcher) {
-    if (!dispatcher) {
-        return baseOptions;
-    }
-    return { ...baseOptions, dispatcher };
-}
-
-// Codes HTTP considérés comme "temporaires" côté CDN — on les retente,
-// éventuellement via un autre proxy/route, au lieu d'abandonner direct.
+//
+// Deux types de routes sont supportées, dans l'ordre où elles seront essayées :
+//  1. Proxies "classiques" (résidentiel/mobile), via OUTBOUND_PROXY_URLS
+//     (liste séparée par des virgules, ex: "http://u1:p1@host1:port,http://u2:p2@host2:port").
+//     OUTBOUND_PROXY_URL (singulier) reste supporté pour compatibilité.
+//  2. Proxies "relais" (Cloudflare Worker), via RELAY_PROXY_URLS
+//     (ex: "https://vavoo-relay.mon-pseudo.workers.dev"). Ces proxies fonctionnent
+//     comme une URL de relais : on leur envoie ?url=<url_cible> et ils font la
+//     requête depuis leur propre IP. RELAY_SECRET (optionnel) est renvoyé dans
+//     l'en-tête x-relay-secret si le Worker vérifie un secret partagé.
+//
+// Si aucune route ne réussit, on retombe sur une connexion directe en dernier
+// recours (sauf si DISABLE_DIRECT_FALLBACK=true). Laisser toutes ces variables
+// vides = comportement inchangé (connexion directe uniquement).
 const RETRYABLE_STATUS_CODES = new Set([403, 408, 429, 500, 502, 503, 504]);
+
+function parseUrlList(raw) {
+    return String(raw || '')
+        .split(',')
+        .map((item) => item.trim())
+        .filter(Boolean);
+}
+
+const classicProxyUrls = parseUrlList(process.env.OUTBOUND_PROXY_URLS || process.env.OUTBOUND_PROXY_URL);
+const relayProxyUrls = parseUrlList(process.env.RELAY_PROXY_URLS);
+const relaySecret = process.env.RELAY_SECRET || '';
+const disableDirectFallback = /^(1|true|yes)$/i.test(process.env.DISABLE_DIRECT_FALLBACK || '');
+
+const outboundRoutes = [];
+
+classicProxyUrls.forEach(function (proxyUrl, index) {
+    const dispatcher = new ProxyAgent(proxyUrl);
+    outboundRoutes.push({
+        name: `proxy#${index + 1}`,
+        buildFetch(targetUrl, baseOptions) {
+            return [targetUrl, { ...baseOptions, dispatcher }];
+        }
+    });
+});
+
+relayProxyUrls.forEach(function (relayUrl, index) {
+    outboundRoutes.push({
+        name: `relay#${index + 1}`,
+        buildFetch(targetUrl, baseOptions) {
+            const separator = relayUrl.includes('?') ? '&' : '?';
+            const relayTarget = `${relayUrl}${separator}url=${encodeURIComponent(targetUrl)}`;
+            const headers = { ...(baseOptions.headers || {}) };
+            if (relaySecret) {
+                headers['x-relay-secret'] = relaySecret;
+            }
+            return [relayTarget, { ...baseOptions, headers }];
+        }
+    });
+});
+
+if (outboundRoutes.length === 0 || !disableDirectFallback) {
+    outboundRoutes.push({
+        name: 'direct',
+        buildFetch(targetUrl, baseOptions) {
+            return [targetUrl, baseOptions];
+        }
+    });
+}
+
+if (classicProxyUrls.length || relayProxyUrls.length) {
+    console.log(`[proxy] Routes configurées (dans l'ordre): ${outboundRoutes.map((route) => route.name).join(', ')}`);
+} else {
+    console.log('[proxy] Aucun OUTBOUND_PROXY_URLS/OUTBOUND_PROXY_URL/RELAY_PROXY_URLS défini — connexion directe uniquement');
+}
 
 const program = new Command();
 
@@ -330,7 +363,7 @@ async function sendHlsMasterPlaylist(req, res, streamUrl) {
     try {
         const upstream = await fetchWithRetry(streamUrl, {
             headers: getStreamHeaders(req)
-        }, { label: 'master-playlist' });
+        });
 
         if (!upstream.ok) {
             throw new Error(`upstream returned HTTP ${upstream.status}`);
@@ -733,7 +766,7 @@ async function proxyStream(req, res, streamUrl, channelName) {
         const upstream = await fetchWithRetry(streamUrl, {
             signal: controller.signal,
             headers: getStreamHeaders(req)
-        }, { label: 'stream-proxy' });
+        });
 
         if (!upstream.ok || !upstream.body) {
             throw new Error(`upstream returned HTTP ${upstream.status}`);
@@ -764,51 +797,46 @@ async function proxyStream(req, res, streamUrl, channelName) {
     }
 }
 
-/**
- * Essaie chaque route sortante (proxy #1, proxy #2, ..., direct) dans l'ordre,
- * avec un petit nombre de tentatives par route. Une réponse est acceptée dès
- * qu'elle est "ok" OU que son statut n'est pas dans RETRYABLE_STATUS_CODES
- * (ex: un vrai 404 n'a aucune raison d'être retenté). On ne passe à la route
- * suivante que si toutes les tentatives sur la route courante ont échoué
- * (erreur réseau, timeout, ou statut retryable comme 403/502).
- *
- * label sert uniquement à des logs lisibles ("hls-proxy", "master-playlist", ...).
- */
-async function fetchWithRetry(url, baseOptions, { retries = 1, label = 'fetch' } = {}) {
+async function fetchWithRetry(url, baseOptions, retriesPerRoute = 2) {
     let lastError;
 
     for (const route of outboundRoutes) {
-        const options = getStreamFetchOptions(baseOptions, route.dispatcher);
-
-        for (let attempt = 0; attempt <= retries; attempt++) {
-            if (options.signal?.aborted) {
+        for (let attempt = 1; attempt <= retriesPerRoute + 1; attempt++) {
+            if (baseOptions.signal?.aborted) {
                 throw lastError || new Error('aborted');
             }
 
             try {
-                const response = await fetch(url, options);
+                const [fetchUrl, fetchOptions] = route.buildFetch(url, baseOptions);
+                const response = await fetch(fetchUrl, fetchOptions);
 
-                if (response.ok || !RETRYABLE_STATUS_CODES.has(response.status)) {
+                if (!RETRYABLE_STATUS_CODES.has(response.status)) {
                     return response;
                 }
 
+                console.log(`[hls-proxy] ${route.name} attempt ${attempt}/${retriesPerRoute + 1} got HTTP ${response.status} for ${describeUpstreamUrl(url)}`);
                 lastError = new Error(`upstream returned HTTP ${response.status}`);
-                console.log(`[${label}] ${route.name} attempt ${attempt + 1}/${retries + 1} got HTTP ${response.status} for ${describeUpstreamUrl(url)}`);
+
+                if (attempt <= retriesPerRoute) {
+                    await new Promise((resolve) => setTimeout(resolve, 400));
+                }
             } catch (error) {
                 lastError = error;
+                if (baseOptions.signal?.aborted) {
+                    throw error;
+                }
                 const causeInfo = error.cause ? ` | cause: ${error.cause.code || error.cause.message || error.cause}` : '';
-                console.log(`[${label}] ${route.name} attempt ${attempt + 1}/${retries + 1} failed for ${describeUpstreamUrl(url)}: ${error.message}${causeInfo}`);
-            }
-
-            if (attempt < retries) {
-                await new Promise((resolve) => setTimeout(resolve, 400));
+                console.log(`[hls-proxy] ${route.name} attempt ${attempt}/${retriesPerRoute + 1} network error for ${describeUpstreamUrl(url)}: ${error.message}${causeInfo}`);
+                if (attempt <= retriesPerRoute) {
+                    await new Promise((resolve) => setTimeout(resolve, 400));
+                }
             }
         }
 
-        console.log(`[${label}] route "${route.name}" exhausted, trying next route`);
+        console.log(`[hls-proxy] route "${route.name}" exhausted, trying next route`);
     }
 
-    throw lastError || new Error('fetchWithRetry: all routes failed');
+    throw lastError || new Error('all routes exhausted');
 }
 
 async function proxyUpstreamUrl(req, res, upstreamUrl) {
@@ -824,7 +852,7 @@ async function proxyUpstreamUrl(req, res, upstreamUrl) {
         const upstream = await fetchWithRetry(upstreamUrl, {
             signal: controller.signal,
             headers: getStreamHeaders(req)
-        }, { label: 'hls-proxy' });
+        });
 
         if (!upstream.ok || !upstream.body) {
             throw new Error(`upstream returned HTTP ${upstream.status}`);
