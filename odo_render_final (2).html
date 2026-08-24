@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lecteur IPTV Vavoo Local</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: Arial, sans-serif;
+            background: #111;
+            color: #fff;
+            margin: 0;
+            display: flex;
+            height: 100vh;
+        }
+        #sidebar {
+            width: 340px;
+            background: #222;
+            border-right: 1px solid #333;
+            display: flex;
+            flex-direction: column;
+        }
+        #sidebar h2 {
+            padding: 10px;
+            margin: 0;
+            font-size: 18px;
+            background: #333;
+        }
+        #search-box {
+            padding: 10px;
+            background: #1a1a1a;
+            border-bottom: 1px solid #333;
+        }
+        #search-input {
+            width: 100%;
+            padding: 8px 10px;
+            border-radius: 6px;
+            border: 1px solid #444;
+            background: #2a2a2a;
+            color: #fff;
+            font-size: 14px;
+        }
+        #search-input:focus {
+            outline: none;
+            border-color: #2d7dfe;
+        }
+        #tabs {
+            display: flex;
+            background: #1a1a1a;
+            border-bottom: 1px solid #333;
+        }
+        .tab-btn {
+            flex: 1;
+            padding: 10px 5px;
+            background: none;
+            border: none;
+            color: #aaa;
+            cursor: pointer;
+            font-size: 13px;
+            border-bottom: 2px solid transparent;
+        }
+        .tab-btn.active {
+            color: #fff;
+            border-bottom: 2px solid #2d7dfe;
+            background: #222;
+        }
+        #tree {
+            flex: 1;
+            overflow-y: auto;
+        }
+        .group-header {
+            padding: 10px 12px;
+            background: #2a2a2a;
+            cursor: pointer;
+            font-weight: bold;
+            font-size: 14px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #333;
+            position: sticky;
+            top: 0;
+        }
+        .group-header .count {
+            font-weight: normal;
+            font-size: 12px;
+            color: #999;
+        }
+        .group-header .arrow {
+            transition: transform 0.15s;
+            margin-left: 6px;
+        }
+        .group-header.collapsed .arrow {
+            transform: rotate(-90deg);
+        }
+        .subgroup-header {
+            padding: 8px 12px 8px 22px;
+            background: #262626;
+            cursor: pointer;
+            font-size: 13px;
+            color: #ccc;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #333;
+        }
+        .subgroup-header .count {
+            font-size: 11px;
+            color: #888;
+        }
+        ul.item-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        ul.item-list.collapsed {
+            display: none;
+        }
+        #channel-list li, ul.item-list li {
+            padding: 10px 12px 10px 34px;
+            border-bottom: 1px solid #2c2c2c;
+            cursor: pointer;
+            transition: background 0.2s;
+            font-size: 14px;
+        }
+        ul.item-list li:hover {
+            background: #444;
+        }
+        ul.item-list li.active {
+            background: rgba(45,125,254,0.25);
+            border-left: 3px solid #2d7dfe;
+        }
+        .empty-msg, .loading-msg {
+            padding: 20px 12px;
+            color: #888;
+            font-size: 13px;
+        }
+        #main-player {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            background: #000;
+            position: relative;
+        }
+        video {
+            width: 100%;
+            max-height: 85vh;
+        }
+        #current-title {
+            padding: 15px;
+            font-size: 20px;
+            background: #1a1a1a;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        #status-badge {
+            font-size: 13px;
+            padding: 3px 10px;
+            border-radius: 12px;
+            background: #555;
+        }
+        #status-badge.loading { background: #b8860b; }
+        #status-badge.playing { background: #1f8b3d; }
+        #status-badge.error { background: #b8302f; }
+        #retry-btn {
+            display: none;
+            margin-left: auto;
+            padding: 6px 14px;
+            border: none;
+            border-radius: 6px;
+            background: #2d7dfe;
+            color: #fff;
+            cursor: pointer;
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="sidebar">
+        <h2>Catalogue IPTV</h2>
+        <div id="search-box">
+            <input type="text" id="search-input" placeholder="Rechercher une chaîne, un film, une série...">
+        </div>
+        <div id="tabs">
+            <button class="tab-btn active" data-tab="tv">Chaînes TV</button>
+            <button class="tab-btn" data-tab="movies">Films</button>
+            <button class="tab-btn" data-tab="series">Séries</button>
+        </div>
+        <div id="tree">
+            <div class="loading-msg">Chargement du catalogue...</div>
+        </div>
+    </div>
+
+    <div id="main-player">
+        <video id="video" controls autoplay playsinline></video>
+        <div id="current-title">
+            <span id="title-text">Sélectionnez une chaîne</span>
+            <span id="status-badge" style="display:none;"></span>
+            <button id="retry-btn">Réessayer</button>
+        </div>
+    </div>
+
+    <script>
+        // Identifiants d'accès familial (mêmes que sur le serveur)
+        const AUTH_USER = 'papa';
+        const AUTH_PASS = 'change-moi-1';
+        const authHeader = 'Basic ' + btoa(AUTH_USER + ':' + AUTH_PASS);
+
+        // URL du catalogue complet (toutes les chaînes/VOD du serveur, sans filtre pays)
+        const m3uUrl = 'https://vavoo-test.onrender.com/channels.m3u8';
+
+        const video = document.getElementById('video');
+        const treeEl = document.getElementById('tree');
+        const searchInput = document.getElementById('search-input');
+        const titleText = document.getElementById('title-text');
+        const statusBadge = document.getElementById('status-badge');
+        const retryBtn = document.getElementById('retry-btn');
+        const tabButtons = document.querySelectorAll('.tab-btn');
+
+        let hls = null;
+        let currentStreamUrl = null;
+        let currentName = null;
+        let currentLi = null;
+        let activeTab = 'tv';
+
+        // Catalogue structuré : { tv: { "France": [items] , "Belgique": [items] ... }, movies: { "Genre": [items] }, series: { "Genre": [items] } }
+        const catalog = { tv: {}, movies: {}, series: {} };
+
+        // ----------------- Détection de catégorie à partir du group-title -----------------
+        function classifyGroup(rawGroup) {
+            const g = (rawGroup || '').toLowerCase();
+
+            const isMovie = /\bvod\b.*film|film.*\bvod\b|\bfilms?\b|\bmovies?\b|\bcinema\b|\bcin[eé]ma\b/.test(g);
+            const isSeries = /\bs[ée]ries?\b|\bseries?\b/.test(g);
+
+            if (isSeries) return { type: 'series', label: cleanGroupLabel(rawGroup, ['série', 'séries', 'series', 'serie', 'vod']) };
+            if (isMovie) return { type: 'movies', label: cleanGroupLabel(rawGroup, ['film', 'films', 'movie', 'movies', 'vod', 'cinema', 'cinéma']) };
+            return { type: 'tv', label: cleanCountryLabel(rawGroup) };
+        }
+
+        function cleanGroupLabel(rawGroup, stripWords) {
+            if (!rawGroup) return 'Autres';
+            let label = rawGroup;
+            // Garde la partie après un séparateur type "Pays | Genre" ou "Pays - Genre"
+            const parts = rawGroup.split(/[\|\-–]/).map(p => p.trim()).filter(Boolean);
+            if (parts.length > 1) label = parts[parts.length - 1];
+            return label || 'Autres';
+        }
+
+        function cleanCountryLabel(rawGroup) {
+            if (!rawGroup) return 'Autres pays';
+            // Cas "France | Généralistes" -> on garde "France" comme pays
+            const parts = rawGroup.split(/[\|\-–]/).map(p => p.trim()).filter(Boolean);
+            return parts[0] || 'Autres pays';
+        }
+
+        function addToCatalog(type, groupLabel, item) {
+            const bucket = catalog[type];
+            const key = groupLabel || 'Autres';
+            if (!bucket[key]) bucket[key] = [];
+            bucket[key].push(item);
+        }
+
+        // ----------------- Lecture flux -----------------
+        function setStatus(state, label) {
+            statusBadge.style.display = 'inline-block';
+            statusBadge.className = state;
+            statusBadge.textContent = label;
+            retryBtn.style.display = state === 'error' ? 'inline-block' : 'none';
+        }
+
+        // ---- Moteur 1 : hls.js (Chrome, Firefox, Edge, la plupart des navigateurs) ----
+        function playWithHlsJs(url) {
+            if (hls) hls.destroy();
+            hls = new Hls({
+                xhrSetup: function (xhr) {
+                    xhr.setRequestHeader('Authorization', authHeader);
+                },
+                maxBufferLength: 60,
+                maxMaxBufferLength: 120,
+                maxBufferSize: 90 * 1000 * 1000,
+                liveSyncDurationCount: 5,
+                fragLoadingMaxRetry: 8,
+                fragLoadingRetryDelay: 1000,
+                fragLoadingMaxRetryTimeout: 20000,
+                manifestLoadingMaxRetry: 6,
+                manifestLoadingRetryDelay: 1000,
+                levelLoadingMaxRetry: 6,
+                levelLoadingRetryDelay: 1000,
+            });
+
+            hls.loadSource(url);
+            hls.attachMedia(video);
+
+            hls.on(Hls.Events.MANIFEST_PARSED, function () {
+                setStatus('playing', 'Lecture');
+                video.play().catch(() => {});
+            });
+
+            hls.on(Hls.Events.ERROR, function (event, data) {
+                if (!data.fatal) return;
+                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                    setStatus('loading', 'Reconnexion...');
+                    hls.startLoad();
+                } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                    setStatus('loading', 'Récupération...');
+                    hls.recoverMediaError();
+                } else {
+                    setStatus('error', 'Erreur — moteur secours');
+                    // ---- Moteur 2 : lecture native du navigateur en secours ----
+                    playNative(url);
+                }
+            });
+        }
+
+        // ---- Moteur 2 : lecture native HLS (Safari/iOS, ou secours) ----
+        function playNative(url) {
+            if (hls) { hls.destroy(); hls = null; }
+            video.src = url;
+            video.addEventListener('loadedmetadata', function onLoaded() {
+                setStatus('playing', 'Lecture (natif)');
+                video.play().catch(() => {});
+                video.removeEventListener('loadedmetadata', onLoaded);
+            });
+            video.addEventListener('error', function onErr() {
+                setStatus('error', 'Échec de lecture');
+                video.removeEventListener('error', onErr);
+            });
+        }
+
+        function playStream(url, name, liElement) {
+            currentStreamUrl = url;
+            currentName = name;
+            currentLi = liElement;
+
+            titleText.textContent = name;
+            setStatus('loading', 'Chargement...');
+
+            document.querySelectorAll('ul.item-list li').forEach(li => li.classList.remove('active'));
+            if (liElement) liElement.classList.add('active');
+
+            if (Hls.isSupported()) {
+                playWithHlsJs(url);
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                playNative(url);
+            } else {
+                setStatus('error', 'Navigateur non supporté');
+            }
+        }
+
+        retryBtn.addEventListener('click', function () {
+            if (currentStreamUrl) {
+                playStream(currentStreamUrl, currentName, currentLi);
+            }
+        });
+
+        // ----------------- Onglets -----------------
+        tabButtons.forEach(btn => {
+            btn.addEventListener('click', () => {
+                tabButtons.forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                activeTab = btn.dataset.tab;
+                renderTree();
+            });
+        });
+
+        // ----------------- Recherche -----------------
+        searchInput.addEventListener('input', () => renderTree());
+
+        // ----------------- Rendu de l'arborescence (groupe -> liste d'éléments) -----------------
+        function renderTree() {
+            const query = searchInput.value.trim().toLowerCase();
+            const bucket = catalog[activeTab];
+            const groupNames = Object.keys(bucket).sort((a, b) => a.localeCompare(b, 'fr'));
+
+            treeEl.innerHTML = '';
+
+            let totalShown = 0;
+
+            groupNames.forEach(groupName => {
+                const items = bucket[groupName].filter(it => !query || it.name.toLowerCase().includes(query));
+                if (items.length === 0) return;
+                totalShown += items.length;
+
+                const header = document.createElement('div');
+                header.className = 'group-header';
+                header.innerHTML = '<span>' + escapeHtml(groupName) + '</span><span><span class="count">' + items.length + '</span><span class="arrow"> ▾</span></span>';
+
+                const ul = document.createElement('ul');
+                ul.className = 'item-list';
+
+                items.forEach(item => {
+                    const li = document.createElement('li');
+                    li.textContent = item.name;
+                    li.onclick = () => playStream(item.url, item.name, li);
+                    ul.appendChild(li);
+                });
+
+                header.addEventListener('click', () => {
+                    header.classList.toggle('collapsed');
+                    ul.classList.toggle('collapsed');
+                });
+
+                treeEl.appendChild(header);
+                treeEl.appendChild(ul);
+            });
+
+            if (totalShown === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'empty-msg';
+                empty.textContent = query ? 'Aucun résultat pour "' + searchInput.value + '".' : 'Aucun élément trouvé dans cette catégorie.';
+                treeEl.appendChild(empty);
+            }
+        }
+
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+
+        // ----------------- Récupération et analyse du M3U -----------------
+        async function parseM3U() {
+            try {
+                const response = await fetch(m3uUrl, {
+                    headers: { 'Authorization': authHeader }
+                });
+                if (!response.ok) throw new Error("Impossible de joindre le proxy (statut " + response.status + ")");
+
+                const text = await response.text();
+                const lines = text.split('\n');
+
+                let name = "";
+                let groupTitle = "";
+
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i].trim();
+
+                    if (line.startsWith('#EXTINF:')) {
+                        const commaIndex = line.lastIndexOf(',');
+                        name = commaIndex !== -1 ? line.substring(commaIndex + 1).trim() : "";
+
+                        const groupMatch = line.match(/group-title="([^"]*)"/i);
+                        groupTitle = groupMatch ? groupMatch[1] : "";
+                    } else if (line.startsWith('http')) {
+                        const streamUrl = line;
+                        const { type, label } = classifyGroup(groupTitle);
+                        addToCatalog(type, label, {
+                            name: name || "Sans nom",
+                            url: streamUrl
+                        });
+                        name = "";
+                        groupTitle = "";
+                    }
+                }
+
+                const totalItems = Object.values(catalog).reduce(
+                    (sum, groups) => sum + Object.values(groups).reduce((s, arr) => s + arr.length, 0), 0
+                );
+
+                if (totalItems === 0) {
+                    treeEl.innerHTML = '<div class="empty-msg">Aucune chaîne trouvée sur le serveur.</div>';
+                    return;
+                }
+
+                renderTree();
+
+            } catch (error) {
+                console.error(error);
+                treeEl.innerHTML = '<div class="empty-msg">Erreur de chargement : ' + escapeHtml(error.message) + '</div>';
+            }
+        }
+
+        parseM3U();
+    </script>
+</body>
+</html>
