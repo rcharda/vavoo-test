@@ -1,7 +1,7 @@
 const { Command } = require('commander');
 const crypto = require('node:crypto');
 const express = require('express');
-const { Readable } = require('node:stream');
+const { Readable, PassThrough } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { Agent, ProxyAgent, setGlobalDispatcher } = require('undici');
 
@@ -97,6 +97,45 @@ function prefetchSegmentsInBackground(segmentUrls, streamHeaders) {
             console.log(`[prefetch] failed for ${describeUpstreamUrl(url)}: ${error.message}`);
         });
     }
+}
+
+// Cache-miss "à la volée" : les octets sont envoyés au client dès qu'ils
+// arrivent (aucun délai de premier octet ajouté), pendant qu'une copie est
+// accumulée en parallèle pour remplir le cache et accélérer les prochaines
+// requêtes sur ce même segment (autre lecteur, retry, etc.).
+async function streamSegmentAndFillCache(res, upstream, upstreamUrl, controllerSignal) {
+    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'video/mp2t');
+    const contentLength = upstream.headers.get('content-length');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.status(upstream.status);
+
+    const nodeStream = Readable.fromWeb(upstream.body);
+    const cacheSink = new PassThrough();
+    const chunks = [];
+    let cacheBytes = 0;
+
+    cacheSink.on('data', function (chunk) {
+        chunks.push(chunk);
+        cacheBytes += chunk.length;
+    });
+    cacheSink.on('end', function () {
+        if (controllerSignal.aborted) return; // ne pas mettre en cache un flux interrompu
+        const buffer = Buffer.concat(chunks, cacheBytes);
+        const entry = {
+            buffer,
+            contentType: upstream.headers.get('content-type') || 'video/mp2t',
+            storedAt: Date.now(),
+            size: buffer.length,
+        };
+        segmentCache.set(upstreamUrl, entry);
+        segmentCacheBytes += entry.size;
+        evictSegmentCacheIfNeeded();
+    });
+    cacheSink.on('error', function () { /* échec de mise en cache : sans impact pour le client */ });
+
+    nodeStream.pipe(cacheSink);
+    await pipeline(nodeStream, res);
 }
 
 function parseUrlList(raw) {
@@ -653,17 +692,32 @@ async function proxyUpstreamUrl(req, res, upstreamUrl) {
     // --- Segment déjà en cache serveur : réponse instantanée, sans attendre Vavoo ---
     const hasRangeRequest = Boolean(req.headers.range);
     if (!hasRangeRequest && isSegmentUrl(upstreamUrl)) {
-        try {
-            const entry = await fetchSegmentBuffer(upstreamUrl, streamHeaders);
-            res.setHeader('Content-Type', entry.contentType);
-            res.setHeader('Content-Length', entry.size);
+        const cached = segmentCache.get(upstreamUrl);
+        if (cached) {
+            res.setHeader('Content-Type', cached.contentType);
+            res.setHeader('Content-Length', cached.size);
             res.setHeader('Accept-Ranges', 'bytes');
-            console.log(`[${connId}] hls asset (cache) "${upstreamLabel}" size=${entry.size}`);
-            res.status(200).send(entry.buffer);
+            console.log(`[${connId}] hls asset (cache) "${upstreamLabel}" size=${cached.size}`);
+            res.status(200).send(cached.buffer);
+            return;
+        }
+        // Pas en cache : on stream en direct vers le client SANS attendre le
+        // téléchargement complet (aucune latence ajoutée), tout en remplissant
+        // le cache en parallèle pour les requêtes suivantes.
+        try {
+            const upstream = await fetchWithRetry(upstreamUrl, { signal: controller.signal, headers: streamHeaders });
+            if (!upstream.ok || !upstream.body) throw new Error(`upstream returned HTTP ${upstream.status}`);
+            console.log(`[${connId}] hls asset (live+cache) "${upstreamLabel}"`);
+            await streamSegmentAndFillCache(res, upstream, upstreamUrl, controller.signal);
             return;
         } catch (error) {
-            console.log(`[${connId}] hls asset cache-fetch failed "${upstreamLabel}": ${error.message}, falling back to direct stream`);
-            // on continue vers le chemin direct ci-dessous en cas d'échec
+            if (controller.signal.aborted) {
+                console.log(`[${connId}] hls proxy ended "${upstreamLabel}"`);
+                return;
+            }
+            console.log(`[${connId}] hls asset live-stream failed "${upstreamLabel}": ${error.message}`);
+            if (res.headersSent) return;
+            // on continue vers le chemin de repli générique ci-dessous
         }
     }
 
