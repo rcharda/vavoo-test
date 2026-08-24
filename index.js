@@ -37,6 +37,29 @@ function getBaseSites(selection) {
 
 const app = express();
 
+// --- Accès familial : identifiants fixes ---
+// Ajoute/retire des membres de la famille ici. Simple protection,
+// pas de gestion de comptes ni d'expiration.
+const FAMILY_USERS = {
+    'papa': 'change-moi-1',
+    'famille': 'change-moi-2',
+};
+
+app.use(function (req, res, next) {
+    const header = req.headers.authorization || '';
+    const [scheme, encoded] = header.split(' ');
+
+    if (scheme === 'Basic' && encoded) {
+        const [user, pass] = Buffer.from(encoded, 'base64').toString().split(':');
+        if (FAMILY_USERS[user] && FAMILY_USERS[user] === pass) {
+            return next();
+        }
+    }
+
+    res.setHeader('WWW-Authenticate', 'Basic realm="Vavoo Proxy"');
+    res.status(401).send('Authentification requise');
+});
+
 // Autoriser les requêtes cross-origin (CORS)
 app.use(function (req, res, next) {
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -53,7 +76,7 @@ app.use(function (req, res, next) {
 });
 
 const httpHost = options.httpHost;
-const port = Number(options.httpPort);
+const port = Number(process.env.PORT || options.httpPort);
 const currentLanguage = options.vavooLanguage;
 const currentRegion = options.vavooRegion;
 const vavooUrlList = options.vavooUrlList;
@@ -73,6 +96,18 @@ const PING_URLS = [
 
 function getLocalBaseUrl() {
     return `http://${httpHost}:${port}`;
+}
+
+function getPublicOrigin(req) {
+    const forwardedHost = req.headers['x-forwarded-host'];
+    const forwardedProto = req.headers['x-forwarded-proto'];
+    const host = forwardedHost ? forwardedHost.split(',')[0].trim() : req.headers.host;
+    const isLocal = /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host || '');
+    let proto = forwardedProto ? forwardedProto.split(',')[0].trim() : req.protocol;
+    if (!isLocal) {
+        proto = 'https';
+    }
+    return `${proto}://${host}`;
 }
 
 function buildHomePage() {
@@ -218,7 +253,7 @@ function getStreamHeaders(req) {
  * Example: `https://host/live.m3u8` -> `/hls-proxy?url=...`.
  */
 function getProxiedUpstreamUrl(req, upstreamUrl) {
-    return `${req.protocol}://${req.headers.host}/hls-proxy?url=${encodeURIComponent(upstreamUrl)}`;
+    return `${getPublicOrigin(req)}/hls-proxy?url=${encodeURIComponent(upstreamUrl)}`;
 }
 
 /**
@@ -718,7 +753,7 @@ app.get('/channels.m3u8', async function (req, res) {
             output.push(`#EXTINF:-1 tvg-name="${channel.name}" group-title="${channel.country}" tvg-logo="${channel.logo}" tvg-id="${channel.name}",${channel.name}`);
             output.push('#EXTVLCOPT:http-user-agent=VAVOO/2.6');
             output.push('#EXTVLCOPT:no-ssl-verify');
-            output.push(`${req.protocol}://${req.headers.host}/stream/${encodeURIComponent(channel.id)}`);
+            output.push(`${getPublicOrigin(req)}/stream/${encodeURIComponent(channel.id)}`);
         }
 
         setPlaylistHeaders(res);
@@ -796,7 +831,7 @@ app.get('/stream/:id', async function (req, res) {
     }
 });
 
-app.listen(port, () => {
+app.listen(port, '0.0.0.0', () => {
     const baseUrl = getLocalBaseUrl();
     console.log(`Listening on ${baseUrl}/`);
     console.log(`M3U: ${baseUrl}/channels.m3u8`);
