@@ -90,12 +90,36 @@ async function fetchSegmentBuffer(upstreamUrl, streamHeaders) {
     }
 }
 
-function prefetchSegmentsInBackground(segmentUrls, streamHeaders) {
-    const toPrefetch = segmentUrls.slice(0, SEGMENT_PREFETCH_COUNT).filter((url) => !segmentCache.has(url));
+const PREFETCH_STAGGER_MS = Number(process.env.PREFETCH_STAGGER_MS || 150);
+const PREFETCH_FAILURE_COOLDOWN_MS = Number(process.env.PREFETCH_FAILURE_COOLDOWN_MS || 20000);
+const recentPrefetchFailures = new Map(); // url -> timestamp du dernier échec
+
+function isInFailureCooldown(url) {
+    const failedAt = recentPrefetchFailures.get(url);
+    if (!failedAt) return false;
+    if (Date.now() - failedAt > PREFETCH_FAILURE_COOLDOWN_MS) {
+        recentPrefetchFailures.delete(url);
+        return false;
+    }
+    return true;
+}
+
+async function prefetchSegmentsInBackground(segmentUrls, streamHeaders) {
+    const toPrefetch = segmentUrls
+        .slice(0, SEGMENT_PREFETCH_COUNT)
+        .filter((url) => !segmentCache.has(url) && !isInFailureCooldown(url));
+
+    // Requêtes espacées dans le temps (pas toutes en parallèle) pour éviter
+    // de "marteler" un flux source instable/partagé entre plusieurs chaînes,
+    // ce qui peut déclencher un throttling (403/429) côté Vavoo.
     for (const url of toPrefetch) {
         fetchSegmentBuffer(url, streamHeaders).catch((error) => {
+            recentPrefetchFailures.set(url, Date.now());
             console.log(`[prefetch] failed for ${describeUpstreamUrl(url)}: ${error.message}`);
         });
+        if (toPrefetch.length > 1) {
+            await new Promise((resolve) => setTimeout(resolve, PREFETCH_STAGGER_MS));
+        }
     }
 }
 
