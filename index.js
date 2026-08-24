@@ -37,6 +37,23 @@ function getBaseSites(selection) {
 
 const app = express();
 
+// Autoriser les requêtes cross-origin (CORS) — doit passer AVANT l'authentification,
+// sinon la requête "preflight" OPTIONS se fait bloquer par l'auth avant de recevoir
+// les en-têtes CORS, ce que le navigateur interprète comme une erreur CORS.
+app.use(function (req, res, next) {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type, Authorization');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
+
+    if (req.method === 'OPTIONS') {
+        res.sendStatus(204);
+        return;
+    }
+
+    next();
+});
+
 // --- Accès familial : identifiants fixes ---
 // Ajoute/retire des membres de la famille ici. Simple protection,
 // pas de gestion de comptes ni d'expiration.
@@ -58,21 +75,6 @@ app.use(function (req, res, next) {
 
     res.setHeader('WWW-Authenticate', 'Basic realm="Vavoo Proxy"');
     res.status(401).send('Authentification requise');
-});
-
-// Autoriser les requêtes cross-origin (CORS)
-app.use(function (req, res, next) {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Range, Content-Type, Authorization');
-    res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
-
-    if (req.method === 'OPTIONS') {
-        res.sendStatus(204);
-        return;
-    }
-
-    next();
 });
 
 const httpHost = options.httpHost;
