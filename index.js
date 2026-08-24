@@ -15,6 +15,90 @@ setGlobalDispatcher(new Agent({
 
 const RETRYABLE_STATUS_CODES = new Set([403, 408, 429, 500, 502, 503, 504]);
 
+// --- Cache serveur des segments HLS (.ts/.aac/...) -------------------------
+// Objectif : le serveur (connexion stable, ex. US) récupère les segments
+// AVANT que le client ne les demande, et les garde en mémoire quelques
+// secondes. Ainsi, si la connexion du client est faible/instable, la requête
+// du lecteur est servie instantanément depuis la RAM du serveur au lieu
+// d'attendre un aller-retour vers Vavoo à chaque segment.
+const SEGMENT_CACHE_TTL_SECONDS = Number(process.env.SEGMENT_CACHE_TTL_SECONDS || 30);
+const SEGMENT_CACHE_MAX_BYTES = Number(process.env.SEGMENT_CACHE_MAX_MB || 200) * 1024 * 1024;
+const SEGMENT_PREFETCH_COUNT = Number(process.env.SEGMENT_PREFETCH_COUNT || 3);
+
+const segmentCache = new Map(); // url -> { buffer, contentType, storedAt, size }
+const inFlightFetches = new Map(); // url -> Promise<{buffer, contentType}>
+let segmentCacheBytes = 0;
+
+function isSegmentUrl(upstreamUrl) {
+    const pathname = new URL(upstreamUrl).pathname.toLowerCase();
+    return /\.(ts|aac|mp4|m4s|key)$/.test(pathname);
+}
+
+function evictSegmentCacheIfNeeded() {
+    if (segmentCacheBytes <= SEGMENT_CACHE_MAX_BYTES) return;
+    const entries = [...segmentCache.entries()].sort((a, b) => a[1].storedAt - b[1].storedAt);
+    while (segmentCacheBytes > SEGMENT_CACHE_MAX_BYTES && entries.length) {
+        const [url, entry] = entries.shift();
+        segmentCache.delete(url);
+        segmentCacheBytes -= entry.size;
+    }
+}
+
+function pruneExpiredSegments() {
+    const cutoff = Date.now() - SEGMENT_CACHE_TTL_SECONDS * 1000;
+    for (const [url, entry] of segmentCache.entries()) {
+        if (entry.storedAt < cutoff) {
+            segmentCache.delete(url);
+            segmentCacheBytes -= entry.size;
+        }
+    }
+}
+
+setInterval(pruneExpiredSegments, 10000).unref();
+
+async function fetchSegmentBuffer(upstreamUrl, streamHeaders) {
+    const cached = segmentCache.get(upstreamUrl);
+    if (cached) return cached;
+
+    const inFlight = inFlightFetches.get(upstreamUrl);
+    if (inFlight) return inFlight;
+
+    const fetchPromise = (async function () {
+        const upstream = await fetchWithRetry(upstreamUrl, { headers: streamHeaders });
+        if (!upstream.ok || !upstream.body) {
+            throw new Error(`upstream returned HTTP ${upstream.status}`);
+        }
+        const arrayBuffer = await upstream.arrayBuffer();
+        const buffer = Buffer.from(arrayBuffer);
+        const entry = {
+            buffer,
+            contentType: upstream.headers.get('content-type') || 'video/mp2t',
+            storedAt: Date.now(),
+            size: buffer.length,
+        };
+        segmentCache.set(upstreamUrl, entry);
+        segmentCacheBytes += entry.size;
+        evictSegmentCacheIfNeeded();
+        return entry;
+    })();
+
+    inFlightFetches.set(upstreamUrl, fetchPromise);
+    try {
+        return await fetchPromise;
+    } finally {
+        inFlightFetches.delete(upstreamUrl);
+    }
+}
+
+function prefetchSegmentsInBackground(segmentUrls, streamHeaders) {
+    const toPrefetch = segmentUrls.slice(0, SEGMENT_PREFETCH_COUNT).filter((url) => !segmentCache.has(url));
+    for (const url of toPrefetch) {
+        fetchSegmentBuffer(url, streamHeaders).catch((error) => {
+            console.log(`[prefetch] failed for ${describeUpstreamUrl(url)}: ${error.message}`);
+        });
+    }
+}
+
 function parseUrlList(raw) {
     return String(raw || '')
         .split(',')
@@ -318,6 +402,21 @@ function rewriteM3u8Playlist(req, upstreamUrl, playlist) {
         .join('\n');
 }
 
+function extractSegmentUrls(baseUrl, playlist) {
+    const urls = [];
+    for (const rawLine of String(playlist).split(/\r?\n/)) {
+        const trimmed = rawLine.trim();
+        if (!trimmed || trimmed.startsWith('#')) continue;
+        if (!shouldRewritePlaylistUri(trimmed)) continue;
+        try {
+            urls.push(new URL(trimmed, baseUrl).toString());
+        } catch (error) {
+            // ignore malformed lines
+        }
+    }
+    return urls;
+}
+
 function getPlaylistDebugInfo(playlist) {
     const lines = String(playlist).split(/\r?\n/);
     const sequenceLine = lines.find((line) => line.startsWith('#EXT-X-MEDIA-SEQUENCE:'));
@@ -548,9 +647,28 @@ async function proxyUpstreamUrl(req, res, upstreamUrl) {
     const connId = `${req.socket.remoteAddress}`;
     const controller = new AbortController();
     const upstreamLabel = describeUpstreamUrl(upstreamUrl);
+    const streamHeaders = getStreamHeaders(req);
     req.socket.on('close', function () { controller.abort(); });
+
+    // --- Segment déjà en cache serveur : réponse instantanée, sans attendre Vavoo ---
+    const hasRangeRequest = Boolean(req.headers.range);
+    if (!hasRangeRequest && isSegmentUrl(upstreamUrl)) {
+        try {
+            const entry = await fetchSegmentBuffer(upstreamUrl, streamHeaders);
+            res.setHeader('Content-Type', entry.contentType);
+            res.setHeader('Content-Length', entry.size);
+            res.setHeader('Accept-Ranges', 'bytes');
+            console.log(`[${connId}] hls asset (cache) "${upstreamLabel}" size=${entry.size}`);
+            res.status(200).send(entry.buffer);
+            return;
+        } catch (error) {
+            console.log(`[${connId}] hls asset cache-fetch failed "${upstreamLabel}": ${error.message}, falling back to direct stream`);
+            // on continue vers le chemin direct ci-dessous en cas d'échec
+        }
+    }
+
     try {
-        const upstream = await fetchWithRetry(upstreamUrl, { signal: controller.signal, headers: getStreamHeaders(req) });
+        const upstream = await fetchWithRetry(upstreamUrl, { signal: controller.signal, headers: streamHeaders });
         if (!upstream.ok || !upstream.body) throw new Error(`upstream returned HTTP ${upstream.status}`);
         const contentType = upstream.headers.get('content-type');
         if (isM3u8Response(upstreamUrl, contentType)) {
@@ -560,6 +678,10 @@ async function proxyUpstreamUrl(req, res, upstreamUrl) {
             console.log(`[${connId}] hls playlist "${upstreamLabel}" status=${upstream.status} sequence=${debugInfo.sequence} entries=${debugInfo.segments}`);
             setPlaylistHeaders(res);
             res.send(rewrittenPlaylist);
+            // Pré-charge en arrière-plan les prochains segments annoncés par la playlist,
+            // pour que les requêtes suivantes du lecteur soient servies depuis le cache.
+            const segmentUrls = extractSegmentUrls(upstreamUrl, playlist).filter((url) => isSegmentUrl(url));
+            if (segmentUrls.length) prefetchSegmentsInBackground(segmentUrls, streamHeaders);
             return;
         }
         setUpstreamHeaders(res, upstream);
