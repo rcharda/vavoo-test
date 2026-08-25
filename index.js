@@ -4,6 +4,7 @@ const express = require('express');
 const { Readable, PassThrough } = require('node:stream');
 const { pipeline } = require('node:stream/promises');
 const { Agent, ProxyAgent, setGlobalDispatcher } = require('undici');
+const health = require('./health-monitor');
 
 const NodeCache = require('node-cache');
 
@@ -11,6 +12,12 @@ setGlobalDispatcher(new Agent({
     connect: { timeout: 30000 },
     headersTimeout: 30000,
     bodyTimeout: 0,
+    // Un lecteur HLS ouvre plusieurs connexions en parallèle (playlist +
+    // plusieurs segments à la fois, surtout avec le préchargement en arrière-
+    // plan). La limite par défaut (10/origine) peut mettre des requêtes en
+    // file d'attente et créer des micro-pauses. On l'augmente.
+    connections: 64,
+    pipelining: 1,
 }));
 
 const RETRYABLE_STATUS_CODES = new Set([403, 408, 429, 500, 502, 503, 504]);
@@ -676,7 +683,12 @@ async function resolveStreamUrl(channel) {
     // qui répond gagne. Si l'un des deux miroirs est lent/instable ce
     // jour-là, on n'attend plus après lui — fini le blocage ~30s côté
     // client sur certaines chaînes.
-    const attempts = baseSites.map(async (baseUrl) => {
+    const orderedSites = health.orderByHealth(baseSites);
+    const allQuarantined = orderedSites.every((site) => health.isQuarantined(site));
+    const attempts = orderedSites.map(async (baseUrl) => {
+        if (!allQuarantined && health.isQuarantined(baseUrl)) {
+            throw new Error(`${baseUrl} en quarantaine (échecs récents)`);
+        }
         const resolveUrl = `${baseUrl.replace(/\/$/, '')}/mediahubmx-resolve.json`;
         try {
             const body = await requestJson({
@@ -685,8 +697,10 @@ async function resolveStreamUrl(channel) {
             });
             const resolvedUrl = (Array.isArray(body) && body[0]?.url) || body?.url || body?.streamUrl;
             if (!resolvedUrl) throw new Error('réponse sans url');
+            health.reportSuccess(baseUrl);
             return resolvedUrl;
         } catch (error) {
+            health.reportFailure(baseUrl);
             const causeInfo = error.cause ? ` | cause: ${error.cause.code || error.cause.message || error.cause}` : '';
             console.log(`[vavoo] resolve failed for ${baseUrl}: ${error.message}${causeInfo}`);
             throw error;
@@ -749,13 +763,27 @@ async function proxyStream(req, res, streamUrl, channelName) {
 
 async function fetchWithRetry(url, baseOptions, retriesPerRoute = 2) {
     let lastError;
-    for (const route of outboundRoutes) {
+    const routeNames = outboundRoutes.map((r) => r.name);
+    const allRoutesQuarantined = routeNames.every((name) => health.isQuarantined(name));
+    const orderedRoutes = outboundRoutes.slice().sort((a, b) => {
+        const qa = (!allRoutesQuarantined && health.isQuarantined(a.name)) ? 1 : 0;
+        const qb = (!allRoutesQuarantined && health.isQuarantined(b.name)) ? 1 : 0;
+        return qa - qb;
+    });
+    for (const route of orderedRoutes) {
+        if (!allRoutesQuarantined && health.isQuarantined(route.name) && orderedRoutes.length > 1) {
+            console.log(`[hls-proxy] route "${route.name}" ignorée (quarantaine)`);
+            continue;
+        }
         for (let attempt = 1; attempt <= retriesPerRoute + 1; attempt++) {
             if (baseOptions.signal?.aborted) throw lastError || new Error('aborted');
             try {
                 const [fetchUrl, fetchOptions] = route.buildFetch(url, baseOptions);
                 const response = await fetch(fetchUrl, fetchOptions);
-                if (!RETRYABLE_STATUS_CODES.has(response.status)) return response;
+                if (!RETRYABLE_STATUS_CODES.has(response.status)) {
+                    health.reportSuccess(route.name);
+                    return response;
+                }
                 console.log(`[hls-proxy] ${route.name} attempt ${attempt}/${retriesPerRoute + 1} got HTTP ${response.status} for ${describeUpstreamUrl(url)}`);
                 lastError = new Error(`upstream returned HTTP ${response.status}`);
                 if (attempt <= retriesPerRoute) await new Promise((resolve) => setTimeout(resolve, 400));
@@ -767,6 +795,7 @@ async function fetchWithRetry(url, baseOptions, retriesPerRoute = 2) {
                 if (attempt <= retriesPerRoute) await new Promise((resolve) => setTimeout(resolve, 400));
             }
         }
+        health.reportFailure(route.name);
         console.log(`[hls-proxy] route "${route.name}" exhausted, trying next route`);
     }
     throw lastError || new Error('all routes exhausted');
@@ -845,6 +874,10 @@ async function proxyUpstreamUrl(req, res, upstreamUrl) {
 
 app.get('/', function (req, res) {
     res.type('html').send(buildHomePage());
+});
+
+app.get('/health-debug', function (req, res) {
+    res.json(health.getDebugSnapshot());
 });
 
 app.get('/countries', async function (req, res) {
