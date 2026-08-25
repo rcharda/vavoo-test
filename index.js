@@ -258,7 +258,11 @@ const FAMILY_USERS = {
     'famille': 'change-moi-2',
 };
 
+const XTREAM_PUBLIC_PATHS = ['/player_api.php', '/get.php', '/xmltv.php'];
 app.use(function (req, res, next) {
+    if (XTREAM_PUBLIC_PATHS.includes(req.path) || req.path.startsWith('/live/')) {
+        return next(); // auth gérée par requireXtreamAccount (user/pass Xtream)
+    }
     const header = req.headers.authorization || '';
     const [scheme, encoded] = header.split(' ');
     if (scheme === 'Basic' && encoded) {
@@ -298,6 +302,113 @@ function getLocalBaseUrl() {
 // par le lecteur (playlist ET segments) porte déjà les identifiants.
 const PLAYER_AUTH_USER = process.env.PLAYER_AUTH_USER || 'papa';
 const PLAYER_AUTH_PASS = process.env.PLAYER_AUTH_PASS || FAMILY_USERS[PLAYER_AUTH_USER] || 'change-moi-1';
+
+// --- Comptes Xtream (validés côté Supabase, table "utilisateurs") ---------
+// On réutilise directement les abonnés existants (colonnes xtream_user /
+// xtream_pass ajoutées par 01_supabase_xtream.sql) : pas de 2e système à
+// maintenir, le blocage/l'expiration déjà gérés dans l'admin s'appliquent
+// automatiquement aux identifiants Xtream aussi.
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || '';
+const XTREAM_CACHE_TTL_SECONDS = 15;
+
+function isAccountExpired(row) {
+    if (!row.date_activation) return false;
+    const duree = String(row.duree || '').trim().toLowerCase();
+    if (duree === 'vie' || duree === 'illimite' || duree === 'illimité') return false;
+    const days = parseInt(duree, 10);
+    if (!Number.isFinite(days)) return false;
+    const expiry = new Date(row.date_activation);
+    expiry.setDate(expiry.getDate() + days);
+    return Date.now() > expiry.getTime();
+}
+
+async function findXtreamAccount(user, pass) {
+    if (!user || !pass || !SUPABASE_URL || !SUPABASE_SERVICE_KEY) return null;
+    const cacheKey = `xtream_acct_${user}_${pass}`;
+    const cached = cache.get(cacheKey);
+    if (cached !== undefined) return cached;
+    const url = `${SUPABASE_URL}/rest/v1/utilisateurs?xtream_user=eq.${encodeURIComponent(user)}&xtream_pass=eq.${encodeURIComponent(pass)}&select=*`;
+    const response = await fetch(url, {
+        headers: { apikey: SUPABASE_SERVICE_KEY, Authorization: `Bearer ${SUPABASE_SERVICE_KEY}` }
+    });
+    if (!response.ok) throw new Error(`supabase lookup failed: HTTP ${response.status}`);
+    const rows = await response.json();
+    const row = rows[0] || null;
+    cache.set(cacheKey, row, XTREAM_CACHE_TTL_SECONDS);
+    return row;
+}
+
+function logXtreamSession(user, cle, req) {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) return;
+    fetch(`${SUPABASE_URL}/rest/v1/xtream_sessions`, {
+        method: 'POST',
+        headers: {
+            apikey: SUPABASE_SERVICE_KEY,
+            Authorization: `Bearer ${SUPABASE_SERVICE_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=minimal'
+        },
+        body: JSON.stringify([{
+            xtream_user: user, cle,
+            ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+            user_agent: req.headers['user-agent'] || '',
+            last_seen: new Date().toISOString()
+        }])
+    }).catch(() => {});
+}
+
+function xtreamAuthError(res) {
+    res.status(401).json({ user_info: { auth: 0, status: 'Disabled' } });
+}
+
+// Middleware : vérifie user/pass Xtream (query OU segment d'URL selon la route),
+// pose req.xtreamAccount si valide.
+async function requireXtreamAccount(req, res, next) {
+    const user = req.query.username || req.params.user;
+    const pass = req.query.password || req.params.pass;
+    try {
+        const account = await findXtreamAccount(user, pass);
+        if (!account) return xtreamAuthError(res);
+        if (account.bloque) return xtreamAuthError(res);
+        if (isAccountExpired(account)) return xtreamAuthError(res);
+        req.xtreamAccount = account;
+        logXtreamSession(user, account.cle, req);
+        next();
+    } catch (error) {
+        console.log(`[xtream] auth error: ${error.message}`);
+        res.status(500).json({ error: 'auth backend unavailable' });
+    }
+}
+
+function getXtreamOrigin(req) {
+    const forwardedHost = req.headers['x-forwarded-host'];
+    const forwardedProto = req.headers['x-forwarded-proto'];
+    const host = forwardedHost ? forwardedHost.split(',')[0].trim() : req.headers.host;
+    const isLocal = /^(127\.0\.0\.1|localhost)(:\d+)?$/.test(host || '');
+    let proto = forwardedProto ? forwardedProto.split(',')[0].trim() : req.protocol;
+    if (!isLocal) proto = 'https';
+    return `${proto}://${host}`;
+}
+
+function xtreamExpiryTimestamp(account) {
+    if (!account.date_activation) return 0;
+    const duree = String(account.duree || '').trim().toLowerCase();
+    if (duree === 'vie' || duree === 'illimite' || duree === 'illimité') return 0; // 0 = illimité côté Xtream
+    const days = parseInt(duree, 10);
+    if (!Number.isFinite(days)) return 0;
+    const expiry = new Date(account.date_activation);
+    expiry.setDate(expiry.getDate() + days);
+    return Math.floor(expiry.getTime() / 1000);
+}
+
+async function buildXtreamChannelList() {
+    const channels = await getChannels();
+    // category_id = pays, pour que le lecteur IPTV regroupe par pays comme /channels.m3u8?country=
+    const categories = [...new Set(channels.map((c) => c.country))];
+    const categoryIndex = new Map(categories.map((name, i) => [name, String(i + 1)]));
+    return { channels, categoryIndex };
+}
 
 function getPublicOrigin(req) {
     const forwardedHost = req.headers['x-forwarded-host'];
@@ -969,6 +1080,149 @@ app.get('/stream/:id', async function (req, res) {
     }
 });
 
+
+// =====================================================
+// XTREAM CODES API — compatible avec n'importe quelle appli IPTV
+// (TiviMate, IPTV Smarters, GSE...). L'utilisateur entre :
+//   Serveur : http(s)://<host>
+//   Utilisateur / Mot de passe : générés dans l'onglet "Xstream" de l'admin
+// =====================================================
+
+// Point d'entrée principal : login + toutes les actions (get_live_categories,
+// get_live_streams, get_live_epg, etc.) passent par player_api.php avec des
+// paramètres GET/POST — c'est le standard Xtream Codes.
+app.all('/player_api.php', requireXtreamAccount, async function (req, res) {
+    const account = req.xtreamAccount;
+    const action = req.query.action;
+    const origin = getXtreamOrigin(req);
+    const baseUserInfo = {
+        username: account.xtream_user,
+        password: account.xtream_pass,
+        message: account.message || '',
+        auth: 1,
+        status: 'Active',
+        exp_date: String(xtreamExpiryTimestamp(account) || ''),
+        is_trial: '0',
+        active_cons: '0',
+        created_at: String(Math.floor(new Date(account.date_activation || Date.now()).getTime() / 1000)),
+        max_connections: String(account.max_ecrans || 1),
+        allowed_output_formats: ['m3u8', 'ts']
+    };
+    const serverInfo = {
+        url: new URL(origin).hostname,
+        port: new URL(origin).port || (origin.startsWith('https') ? '443' : '80'),
+        https_port: origin.startsWith('https') ? (new URL(origin).port || '443') : '443',
+        server_protocol: origin.startsWith('https') ? 'https' : 'http',
+        rtmp_port: '0',
+        timezone: 'Europe/Paris',
+        timestamp_now: Math.floor(Date.now() / 1000),
+        time_now: new Date().toISOString().replace('T', ' ').slice(0, 19)
+    };
+
+    try {
+        if (!action) {
+            res.json({ user_info: baseUserInfo, server_info: serverInfo });
+            return;
+        }
+
+        const { channels, categoryIndex } = await buildXtreamChannelList();
+
+        if (action === 'get_live_categories') {
+            res.json([...categoryIndex.entries()].map(([name, id]) => ({
+                category_id: id, category_name: name, parent_id: 0
+            })));
+            return;
+        }
+
+        if (action === 'get_live_streams') {
+            const categoryId = req.query.category_id;
+            const list = channels
+                .filter((c) => !categoryId || categoryIndex.get(c.country) === categoryId)
+                .map((c, i) => ({
+                    num: i + 1,
+                    name: c.name,
+                    stream_type: 'live',
+                    stream_id: c.id,
+                    stream_icon: c.logo || '',
+                    epg_channel_id: c.name,
+                    added: String(Math.floor(Date.now() / 1000)),
+                    category_id: categoryIndex.get(c.country) || '0',
+                    custom_sid: '',
+                    tv_archive: 0,
+                    direct_source: '',
+                    tv_archive_duration: 0
+                }));
+            res.json(list);
+            return;
+        }
+
+        if (action === 'get_vod_categories' || action === 'get_series_categories') {
+            res.json([]); // pas de VOD/séries côté Vavoo : chaînes live uniquement
+            return;
+        }
+        if (action === 'get_vod_streams' || action === 'get_series') {
+            res.json([]);
+            return;
+        }
+
+        if (action === 'get_short_epg' || action === 'get_simple_data_table') {
+            res.json({ epg_listings: [] }); // pas d'EPG fourni par Vavoo actuellement
+            return;
+        }
+
+        res.json({ user_info: baseUserInfo, server_info: serverInfo });
+    } catch (error) {
+        console.log(`[xtream] player_api error: ${error.message}`);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// get.php : génère la playlist M3U complète (utilisé par certains lecteurs
+// à la place de player_api.php, ou pour un import "playlist M3U" classique).
+app.get('/get.php', requireXtreamAccount, async function (req, res) {
+    try {
+        const origin = getXtreamOrigin(req);
+        const { channels } = await buildXtreamChannelList();
+        const account = req.xtreamAccount;
+        const output = ['#EXTM3U'];
+        for (const channel of channels) {
+            output.push(`#EXTINF:-1 tvg-id="${channel.name}" tvg-name="${channel.name}" tvg-logo="${channel.logo}" group-title="${channel.country}",${channel.name}`);
+            output.push(`${origin}/live/${encodeURIComponent(account.xtream_user)}/${encodeURIComponent(account.xtream_pass)}/${encodeURIComponent(channel.id)}.m3u8`);
+        }
+        setPlaylistHeaders(res);
+        res.send(output.join('\n'));
+    } catch (error) {
+        res.status(500).send(error.message);
+    }
+});
+
+// xmltv.php : EPG vide mais présent (certains lecteurs le requêtent au
+// démarrage et affichent une erreur s'il n'existe pas du tout).
+app.get('/xmltv.php', requireXtreamAccount, function (req, res) {
+    res.type('application/xml').send('<?xml version="1.0" encoding="UTF-8"?><tv></tv>');
+});
+
+// URL de lecture standard Xtream : /live/<user>/<pass>/<stream_id>.m3u8 (ou .ts)
+app.get('/live/:user/:pass/:streamid', requireXtreamAccount, async function (req, res) {
+    const connId = `${req.socket.remoteAddress}`;
+    try {
+        const channelId = normalizeStreamId(String(req.params.streamid).replace(/\.(m3u8|ts)$/i, ''));
+        const channel = await findChannelById(channelId);
+        if (!channel) {
+            res.status(404).send(`unknown channel: ${channelId}`);
+            return;
+        }
+        const streamUrl = await resolveStreamUrl(channel);
+        if (isM3u8Url(streamUrl)) {
+            await sendHlsMasterPlaylist(req, res, streamUrl);
+            return;
+        }
+        await proxyStream(req, res, streamUrl, channel.name);
+    } catch (error) {
+        console.log(`[${connId}] xtream live error: ${error.message}`);
+        if (!res.headersSent) res.status(500).send(error.message);
+    }
+});
 
 app.listen(port, '0.0.0.0', () => {
     const baseUrl = getLocalBaseUrl();
