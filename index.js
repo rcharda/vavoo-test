@@ -705,7 +705,10 @@ async function resolveStreamUrl(channel) {
 async function proxyStream(req, res, streamUrl, channelName) {
     const connId = `${req.socket.remoteAddress}`;
     const controller = new AbortController();
-    req.socket.on('close', function () {
+    // req.on (pas req.socket.on) : listener propre à CETTE requête, retiré
+    // automatiquement à la fin — évite l'accumulation de listeners quand le
+    // socket TCP est réutilisé (keep-alive) pour plusieurs requêtes.
+    req.on('close', function () {
         console.log(`[${connId}] connection closed`);
         controller.abort();
     });
@@ -774,7 +777,7 @@ async function proxyUpstreamUrl(req, res, upstreamUrl) {
     const controller = new AbortController();
     const upstreamLabel = describeUpstreamUrl(upstreamUrl);
     const streamHeaders = getStreamHeaders(req);
-    req.socket.on('close', function () { controller.abort(); });
+    req.on('close', function () { controller.abort(); }); // req, pas req.socket : évite le leak de listeners sur socket keep-alive
 
     // --- Segment déjà en cache serveur : réponse instantanée, sans attendre Vavoo ---
     const hasRangeRequest = Boolean(req.headers.range);
