@@ -449,6 +449,34 @@ function rewritePlaylistUri(req, baseUrl, uri) {
     return getProxiedUpstreamUrl(req, new URL(uri, baseUrl).toString());
 }
 
+// Si la source propose plusieurs débits (playlist maître HLS avec
+// #EXT-X-STREAM-INF), on choisit automatiquement la variante la plus légère
+// pour les clients en connexion faible — sans transcoder, donc sans coût CPU.
+// Activé via /stream/:id?quality=low (le client passe ce paramètre quand il
+// détecte une connexion lente, ou par défaut si tu préfères la sécurité).
+function isMasterPlaylist(playlist) {
+    return /#EXT-X-STREAM-INF/.test(playlist);
+}
+
+function pickLowestBandwidthVariant(baseUrl, playlist) {
+    const lines = String(playlist).split(/\r?\n/);
+    let best = null;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (!line.startsWith('#EXT-X-STREAM-INF')) continue;
+        const match = line.match(/BANDWIDTH=(\d+)/);
+        const bandwidth = match ? Number(match[1]) : Infinity;
+        const uriLine = (lines[i + 1] || '').trim();
+        if (!uriLine || uriLine.startsWith('#')) continue;
+        if (!best || bandwidth < best.bandwidth) {
+            try {
+                best = { bandwidth, url: new URL(uriLine, baseUrl).toString() };
+            } catch (error) { /* URI malformée, on ignore cette variante */ }
+        }
+    }
+    return best ? best.url : null;
+}
+
 function rewriteM3u8Playlist(req, upstreamUrl, playlist) {
     return String(playlist)
         .split(/\r?\n/)
@@ -663,6 +691,17 @@ async function proxyStream(req, res, streamUrl, channelName) {
         const contentType = upstream.headers.get('content-type');
         if (isM3u8Response(streamUrl, contentType)) {
             const playlist = await upstream.text();
+            // Connexion faible : si la source propose plusieurs débits, on
+            // suit automatiquement la variante la plus légère (zéro coût CPU,
+            // juste du choix d'URL) au lieu du flux "auto" qui démarre
+            // souvent en haute qualité.
+            if (req.query.quality === 'low' && isMasterPlaylist(playlist)) {
+                const lightUrl = pickLowestBandwidthVariant(streamUrl, playlist);
+                if (lightUrl) {
+                    console.log(`[${connId}] variante basse qualité choisie pour "${channelName}"`);
+                    return proxyStream(req, res, lightUrl, channelName);
+                }
+            }
             const rewrittenPlaylist = rewriteM3u8Playlist(req, streamUrl, playlist);
             setPlaylistHeaders(res);
             res.send(rewrittenPlaylist);
@@ -809,6 +848,7 @@ app.get('/channels.m3u8', async function (req, res) {
     }
 });
 
+
 app.get('/hls-proxy', async function (req, res) {
     const upstreamUrl = req.query.url;
     const connId = `${req.socket.remoteAddress}`;
@@ -831,6 +871,12 @@ app.get('/hls-proxy', async function (req, res) {
         res.status(400).send(`invalid upstream url: ${error.message}`);
     }
 });
+
+// --- Lecture "instantanée basse qualité" via transcodage serveur ---------
+// /live/:id/playlist.m3u8 : démarre (ou rejoint) le transcodeur de la
+// chaîne, attend que les premiers segments existent, puis sert la playlist.
+// Le player (hls.js côté client) n'a plus qu'à lire des segments minuscules
+// déjà prêts → plus d'attente réseau perceptible au clic.
 
 app.get('/stream/:id', async function (req, res) {
     const connId = `${req.socket.remoteAddress}`;
@@ -862,6 +908,7 @@ app.get('/stream/:id', async function (req, res) {
         res.status(500).send(error.message);
     }
 });
+
 
 app.listen(port, '0.0.0.0', () => {
     const baseUrl = getLocalBaseUrl();
