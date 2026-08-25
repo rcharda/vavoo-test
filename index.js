@@ -976,4 +976,34 @@ app.listen(port, '0.0.0.0', () => {
     console.log(`M3U: ${baseUrl}/channels.m3u8`);
     console.log(`Example filtered M3U: ${baseUrl}/channels.m3u8?country=Germany`);
     console.log(`Countries: ${baseUrl}/countries`);
+
+    // ── Préchauffage au démarrage ─────────────────────────────────────
+    // Sur Render, chaque redémarrage (déploiement, réveil après mise en
+    // veille) repart avec un cache vide. Sans ça, le TOUT PREMIER clic
+    // client après un redémarrage paie le coût complet de charger le
+    // catalogue + la signature Vavoo (plusieurs secondes), en plus de la
+    // résolution du flux. On le fait une fois ici, en arrière-plan, pour
+    // que ce coût soit payé par le serveur au démarrage et non par le
+    // premier utilisateur qui clique.
+    getChannels()
+        .then(async (channels) => {
+            console.log(`[warmup] catalogue préchauffé (${channels.length} chaînes)`);
+            // Optionnel : préchauffe aussi la RÉSOLUTION des chaînes les plus
+            // regardées, si tu renseignes leurs IDs dans la variable
+            // d'environnement WARMUP_CHANNEL_IDS (séparés par des virgules).
+            // Sans ça, chaque ID listé ici bénéficie d'un premier clic
+            // vraiment instantané même juste après un redémarrage.
+            const warmupIds = parseUrlList(process.env.WARMUP_CHANNEL_IDS);
+            for (const id of warmupIds) {
+                try {
+                    const channel = await findChannelById(id);
+                    if (!channel) { console.log(`[warmup] chaîne inconnue: ${id}`); continue; }
+                    await resolveStreamUrl(channel);
+                    console.log(`[warmup] résolution préchauffée: ${channel.name}`);
+                } catch (error) {
+                    console.log(`[warmup] échec résolution ${id}:`, error.message);
+                }
+            }
+        })
+        .catch((error) => console.log('[warmup] échec préchauffage catalogue:', error.message));
 });
