@@ -556,7 +556,9 @@ async function requestJson(options) {
         method: options.method || 'GET',
         headers: options.headers,
         body: options.body ? JSON.stringify(options.body) : undefined,
-        signal: AbortSignal.timeout(options.timeout || 30000),
+        // 8s au lieu de 30s : si vavoo.to traîne, on bascule vite sur
+        // kool.to plutôt que de bloquer le clic de l'utilisateur ~30s.
+        signal: AbortSignal.timeout(options.timeout || 8000),
     });
     const body = await response.json();
     if (!response.ok) {
@@ -658,24 +660,46 @@ function normalizeStreamId(id) {
     return String(id || '').split('|')[0];
 }
 
+// Petit cache court : si l'utilisateur re-clique vite sur la même chaîne
+// (ou si le player recharge la playlist), on évite de re-résoudre à chaque
+// fois — gain de temps direct au clic.
+const RESOLVE_CACHE_TTL_SECONDS = 20;
+
 async function resolveStreamUrl(channel) {
+    const cacheKey = `resolve_${channel.id}`;
+    const cached = cache.get(cacheKey);
+    if (cached) return cached;
+
     const signature = await getAddonSignature();
-    for (const baseUrl of baseSites) {
+
+    // On interroge vavoo.to ET kool.to EN PARALLÈLE : le premier des deux
+    // qui répond gagne. Si l'un des deux miroirs est lent/instable ce
+    // jour-là, on n'attend plus après lui — fini le blocage ~30s côté
+    // client sur certaines chaînes.
+    const attempts = baseSites.map(async (baseUrl) => {
         const resolveUrl = `${baseUrl.replace(/\/$/, '')}/mediahubmx-resolve.json`;
         try {
             const body = await requestJson({
                 method: 'POST', url: resolveUrl, headers: getCatalogHeaders(signature),
                 body: { language: currentLanguage, region: currentRegion, url: channel.url, clientVersion: '3.0.2' }
             });
-            if (Array.isArray(body) && body[0]?.url) return body[0].url;
-            if (body?.url) return body.url;
-            if (body?.streamUrl) return body.streamUrl;
+            const resolvedUrl = (Array.isArray(body) && body[0]?.url) || body?.url || body?.streamUrl;
+            if (!resolvedUrl) throw new Error('réponse sans url');
+            return resolvedUrl;
         } catch (error) {
             const causeInfo = error.cause ? ` | cause: ${error.cause.code || error.cause.message || error.cause}` : '';
             console.log(`[vavoo] resolve failed for ${baseUrl}: ${error.message}${causeInfo}`);
+            throw error;
         }
+    });
+
+    try {
+        const resolvedUrl = await Promise.any(attempts);
+        cache.set(cacheKey, resolvedUrl, RESOLVE_CACHE_TTL_SECONDS);
+        return resolvedUrl;
+    } catch (error) {
+        throw new Error(`Unable to resolve stream for channel ${channel.name}`);
     }
-    throw new Error(`Unable to resolve stream for channel ${channel.name}`);
 }
 
 async function proxyStream(req, res, streamUrl, channelName) {
